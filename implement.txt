@@ -1,0 +1,289 @@
+耐久レース チーム位置共有アプリ 実装仕様書
+作成日：2026-11-02　対象バージョン：APP_VERSION 1.0.0
+
+■1. 技術スタック（2026-11-02 に npm registry と公式ドキュメントで確認した安定版）
+- vite 8.3.5
+- react / react-dom 19.3.1
+- @vitejs/plugin-react 6.1.2
+- typescript 7.0.2
+- leaflet 1.9.4、@types/leaflet 1.9.22（Leaflet 2.x はまだ安定版ではないので使わない）
+- react-leaflet 5.0.0（peer依存：leaflet ^1.9.0、react ^19.0.0）
+- @supabase/supabase-js 2.118.0
+- vitest 5.0.5
+- wrangler 4.156.1
+- package.json のバージョンは固定で書く（^ は付けない）
+- 外部の状態管理ライブラリやルーターは使わない（React の state と context だけで作る）
+
+■2. ディレクトリ構成
+gpx-track/
+  spec.txt / implement.txt / CLAUDE.md
+  package.json / tsconfig.json / vite.config.ts / index.html
+  wrangler.jsonc               Cloudflare Workers（静的アセット）の設定
+  .env.example                 VITE_SUPABASE_URL / VITE_SUPABASE_PUBLISHABLE_KEY
+  .gitignore                   node_modules, dist, .wrangler, .env*.local
+  supabase/
+    schema.sql                 テーブル、RLS、RPC、トリガー、Realtimeのポリシー
+    set_owner_passcode.sql     オーナーパスコードの設定と変更
+    cleanup.sql                古いデータと匿名ユーザーの削除（手動で実行）
+  src/
+    main.tsx / App.tsx         画面の切り替え（名前登録 / ホーム / 作成 / ルーム）
+    version.ts                 export const APP_VERSION = '1.0.0'
+    config.ts                  定数（送信間隔、精度上限、延長距離など。■9を参照）
+    lib/supabase.ts            createClient（publishable key を使う）
+    lib/geo.ts                 緯度経度と平面座標（m）の変換、距離、線分の交差判定
+    lib/lapDetector.ts         通過判定（純粋関数）
+    lib/movingState.ts         走行状態と走行距離の計算（純粋関数）
+    lib/laps.ts                ラップ表を組み立てる（純粋関数）
+    lib/format.ts              時刻とラップタイムの書式
+    lib/types.ts               型定義（Room, LapRow, Fix など）
+    lib/crossingQueue.ts       送信できなかった通過と距離データを保存し（localStorage）、再送する
+    hooks/useAuth.ts           匿名サインインとプロフィール
+    hooks/useRoom.ts           ルームのデータ取得と private チャネル（pos の broadcast、presence、DBからの配信）
+    hooks/useGeolocation.ts    watchPosition のラッパー（?sim のときは疑似GPS）
+    hooks/useWakeLock.ts
+    hooks/useTracker.ts        走行状態、位置の送信、通過の記録、距離の記録をまとめて行う
+    components/  NameSetup, Home, CreateRoom, ReclaimOwner, RoomScreen, Header,
+                 MapView（ライン編集を含む）, LapTable, LapRowMenu, ChatArea（QuickButtons を含む）,
+                 SettingsMenu, Modal（ConfirmModal を含む）, Notify（画面上部の通知）
+    dev/gpsSimulator.ts        開発用の疑似GPS
+  tests/  geo.test.ts, lapDetector.test.ts, movingState.test.ts, laps.test.ts, format.test.ts
+
+■3. Supabase
+3.1 事前設定（ユーザーがダッシュボードで行う）
+ 1. プロジェクトを作り、Project URL と Publishable key（sb_publishable_...）を控える
+ 2. Authentication > Providers で Anonymous Sign-Ins を有効にする
+ 3. Realtime > Settings で「Allow public access」を無効にする（private チャネルを必須にするため）
+ 4. SQL Editor で supabase/schema.sql を実行する。続けて set_owner_passcode.sql のパスコードを書き換えて実行する
+
+3.2 テーブル（public スキーマ。すべて RLS を有効にする）
+- profiles
+  - id uuid PK（auth.users.id）、name text（1〜20文字）、updated_at
+- app_config
+  - id int PK（常に1）、owner_passcode_hash text
+  - ポリシーを付けないので、クライアントからは読めない
+- rooms
+  - id uuid PK、code text unique（6文字）、team_name text、owner_id uuid
+  - duration_min int null、min_lap_sec int default 30、moving_kmh int default 15（3〜100）
+  - line_a_lat, line_a_lng, line_b_lat, line_b_lng（double precision、null可）
+  - status text：'ready' / 'running' / 'finished'
+  - started_at, finished_at（timestamptz、null可）
+  - last_crosser_id uuid null（最後に通過した人。現在のライダーの代わりに表示するため）
+  - created_at
+- room_members
+  - room_id、user_id、color_idx int、joined_at、PK(room_id, user_id)
+- crossings（通過の記録）
+  - id uuid PK、room_id、crosser_id（ラインを越えた人）、crosser_name text（その時点の名前）
+  - crossed_at timestamptz、source text：'gps' / 'manual'
+  - driver_override_id uuid null（オーナーが修正した名前）
+  - deleted bool default false、created_at
+  - unique(room_id, crossed_at)
+- distance_segments（走行距離の記録）
+  - id bigserial PK、room_id、user_id、t_from timestamptz、t_to timestamptz、meters real
+  - index (room_id, t_to)
+- messages
+  - id bigserial PK、room_id、user_id null、name text、body text（1〜50文字）
+  - kind text：'user' / 'system'、created_at
+
+3.3 RLS
+- メンバーかどうかの判定には is_room_member(room uuid) を使う（security definer、stable）。RLS が再帰しないようにするため
+- SELECT
+  - rooms / room_members / crossings / messages / distance_segments は、is_room_member(room_id) のときだけ読める
+  - profiles は、本人と、同じルームのメンバーの行だけ読める
+- INSERT
+  - messages：user_id = auth.uid()、kind = 'user'、メンバーであること
+  - distance_segments：user_id = auth.uid()、メンバーであること、レース中であること
+  - profiles：本人の行だけ upsert できる
+- DELETE
+  - room_members：本人の行だけ削除できる（ルームからの退出に使う）
+- messages の name は、BEFORE INSERT トリガーでプロフィールの名前に置き換える（なりすまし防止）
+- それ以外の書き込みはすべて RPC を通す。RPC は security definer にし、関数の中で権限を確認し、search_path = '' に固定する
+
+3.4 RPC
+- create_room(passcode, team_name, duration_min, min_lap_sec, moving_kmh)
+  - extensions.crypt でパスコードを照合する。紛らわしい文字を除いた6文字のコードを作り、重複したら作り直す
+  - ルームと、オーナーのメンバー行を作る
+- join_room(code)
+  - メンバーに追加する（参加済みなら何もしない）。color_idx は参加順に割り当てる
+- reclaim_owner(code, passcode)
+  - パスコードが一致したら owner_id を自分に変え、メンバーにも追加する
+- set_line(room, a_lat, a_lng, b_lat, b_lng)　［オーナー］
+- update_room_settings(room, min_lap_sec, moving_kmh)　［オーナー］
+- start_race(room) / set_start_time(room, ts) / finish_race(room)　［オーナー］
+  - 状態と時刻を更新し、システムメッセージを投稿する
+- record_crossing(room, crossed_at)　［メンバー］
+  - rooms の行を FOR UPDATE でロックしてから直前の通過を確認する（ほぼ同時に2人が通過したときの競合を防ぐため）
+  - 確認する条件：spec 5.2 に加えて、now() より5秒以上未来の時刻は拒否する
+  - 最小ラップ秒数は、前後の通過（再送で古い時刻が届く場合があるため前後両方）とレース開始時刻のどちらからも離れていることを確認する
+    （スタート直後にラインを越えても1周と数えないため）
+  - 同じ人が同じ時刻で送ってきた場合は 'duplicate' を返す（再送のため）
+  - 記録したら rooms.last_crosser_id を更新する（値が変わるときだけ）。前の通過と違う人なら「ライダー交代：◯◯」のシステムメッセージを投稿する
+  - 戻り値：'recorded' / 'duplicate' / 'too_soon' / 'not_running' / 'out_of_range'
+- add_manual_crossing(room, crossed_at)　［オーナー］
+  - source = 'manual'。crosser には、その時刻の直前に通過した人（いなければ last_crosser_id、それもなければオーナー）を入れる。最小ラップ秒数は確認しない
+- delete_crossing(id)　［オーナー］
+  - deleted = true にする（論理削除）
+- set_crossing_driver(id, user_id or null)　［オーナー］
+  - driver_override_id を設定する。null なら自動判定に戻す
+- get_lap_table(room)　［メンバー］
+  - ラップ表を返す（3.5を参照）
+- update_profile_name(name)　［本人］
+
+3.5 ラップ表の計算（get_lap_table。サーバー側で計算する）
+- 対象は deleted = false の crossings。crossed_at の昇順に並べ、row_number() を周番号にする
+- 周の区間：[前の通過時刻, 今回の通過時刻]。1周目は [started_at, 1回目の通過時刻]
+- メンバーごとのその周の走行距離＝区間と重なる distance_segments の meters を合計する
+  - 一部だけ重なる区間は、重なった時間の割合で按分する
+    - meters × (least(t_to, 周の終わり) − greatest(t_from, 周の始まり)) / (t_to − t_from)
+- ラップのライダーを決める優先順位
+  1. driver_override_id
+  2. 走行距離が最も長いメンバー（同じなら crosser）
+  3. どちらもなければ crosser
+- 名前は profiles の今の名前を使う（取れなければ crosser_name）
+- 戻り値の列：lap_no, crossing_id, crossed_at, lap_ms, driver_id, driver_name, driver_meters, source, is_override
+- 名前の確定：直近の周で、終わってから15秒未満のものは「暫定」とし、クライアント側で薄く表示する
+
+3.6 Realtime
+- 1ルームにつき private チャネルを1本だけ使う
+  - トピック：room:<room_id>
+  - 設定：{ private: true, broadcast: { self: false }, presence: { key: user_id } }
+- realtime.messages に付けるポリシー（SELECT と INSERT、対象は authenticated）
+  - exists(select 1 from public.room_members m where m.user_id = (select auth.uid()) and 'room:' || m.room_id::text = (select realtime.topic())) and realtime.messages.extension in ('broadcast','presence')
+  - realtime.messages には ALTER TABLE をかけない（公式ドキュメントで禁止されているため）
+- クライアントから送る broadcast「pos」：{ uid, lat, lng, acc, spd, moving, t }
+- presence：参加したときに track({ uid, name }) を1回だけ行う（Presence は頻繁に更新しない、という公式の注意に従う）
+- DBの変更の配信：rooms / crossings / messages / room_members / profiles（名前の変更）に AFTER トリガーを付ける
+  - realtime.send(payload, event, 'room:' || room_id, true) で同じトピックに送る
+  - 配信に失敗しても本来の処理（通過の記録など）は止めない（例外を握りつぶして警告だけ出す）
+  - イベント名：room / crossing / message / member
+  - distance_segments の挿入は配信しない（配信の回数を節約するため）
+  - postgres_changes は使わない（DELETE で絞り込めないこと、private チャネル1本にまとめられないことが理由）
+- 受け取ったときの処理
+  - message：リストに追加する
+  - crossing：get_lap_table を呼び直す。さらに15秒後にもう一度呼び、遅れて届いた距離データで名前を確定させる
+  - room / member：該当するデータを取り直す
+- チャネルの状態が SUBSCRIBED に戻ったとき（再接続したとき）は、すべてのデータを取り直して取りこぼしを埋める
+- サインインした後に supabase.realtime.setAuth() を呼んでからチャネルに参加する（今のSDKで必要かどうかは実装するときに確認する）
+
+3.7 無料枠の見積もり（2026-11 時点の Supabase 料金ページで確認）
+- 無料枠
+  - Realtime メッセージ 200万/月、同時接続 200、毎秒 100メッセージ
+  - DB 500MB、月間アクティブユーザー 5万
+  - 1週間使わないと一時停止する
+- 数え方：Broadcast は「送信1回＋受信する人数分」、DBからの配信は「受信する人数分」
+- 位置の配信（走行中の1人が0.2回/秒（5秒ごと）、ピットの人が0.1回/秒）
+  - 5人：(0.2＋0.4)×(1＋4)＝3メッセージ/秒 → 7時間で約7.6万
+  - 10人：(0.2＋0.9)×10＝11メッセージ/秒 → 7時間で約27.7万
+- ラップとチャットの配信は1レースで数千メッセージ程度なので、ほぼ影響しない
+- 走行距離は REST での INSERT なので、Realtime メッセージには数えられない
+  - 7時間で約2,500行（10秒ごと×1人）。DB容量への影響もほぼない
+- 結論：5人なら月25回程度、10人なら月7回程度の7時間レースまで無料枠に収まる
+  - 足りない場合は、config.ts の POS_INTERVAL_PIT_MS を 30000 にすると、ピットにいる人の分の消費が3分の1になる
+- 無料枠を超えても課金はされない（通知が来て猶予期間に入る）
+- Cloudflare Workers：静的アセットへのリクエストは、無料プランでも無料・回数無制限
+
+■4. 通過判定（lib/lapDetector.ts）
+- 入力：直前の測位P、今回の測位Q、ラインの端点A・B、設定（延長15m、最大間隔20秒、判定速度）
+- 平面化：ラインの中点 (lat0, lng0) を原点にした正距円筒近似を使う
+  - x = Δlng × cos(lat0) × R、y = Δlat × R（R = 6371008.8m、角度はラジアン）
+- AB を両端15mずつ延長して A'B' とし、d = B'−A'、r = Q−P とする
+  - den = cross(r, d)。den = 0（平行）なら交差しないとする
+  - t = cross(A'−P, d) / den、u = cross(A'−P, r) / den
+  - 0 ≤ t ≤ 1 かつ 0 ≤ u ≤ 1 なら交差する
+- 速度の条件：|Q−P| / (Q.t−P.t) が判定速度（m/sに換算）より遅ければ、通過にしない
+- 時間の条件：Q.t − P.t が20秒を超えていたら判定しない
+- 通過時刻：P.t + t × (Q.t − P.t)（時刻は position.timestamp を使う）
+- 同じ端末で、前回の通過から最小ラップ秒数たっていない場合は送信しない（サーバー側でも確認する）
+
+■5. 走行状態と走行距離（lib/movingState.ts）
+- 精度が30mより悪い点は捨てる（直前の点も更新しない）
+- 速度：coords.speed（m/s）が null でなければそれを使う。null なら直前の点との距離÷時間で求める
+- 走行状態の切り替え（ヒステリシスで状態がちらつくのを防ぐ）
+  - ピット→走行中：判定速度以上が10秒続いたとき
+  - 走行中→ピット：判定速度未満が30秒続いたとき
+- 走行距離：直前の点から今回の点までの区間速度が判定速度以上で、間隔が20秒以内なら、その距離を加える
+- 加えた距離は10秒ごとに1つのセグメント { t_from, t_to, meters } にまとめて、distance_segments に INSERT する
+  - meters が 0 のセグメントは送らない
+  - 送信に失敗したら crossingQueue に入れて再送する
+  - レース中のときだけ送る
+
+■6. ラップ表の表示（lib/laps.ts）
+- get_lap_table の結果を降順に並べ替え、ベストラップ（lap_ms の最小値。手動の周も含む）、平均、★を付ける
+- 暫定の周（3.5）は名前を薄い色で表示する
+
+■7. フロントの実装メモ
+- Leaflet
+  - タイル URL：https://tile.openstreetmap.org/{z}/{x}/{y}.png、maxZoom 19
+  - attribution：&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors
+  - OSM の利用規約に従い、先読みや一括ダウンロードはしない。Referrer-Policy は既定のまま（no-referrer にしない）
+- マーカーは L.divIcon で作る（色付きの丸と名前）。パレットは10色で、color_idx を10で割った余りで選ぶ
+- 現在のライダー：pos の moving が true のメンバーを選ぶ。複数いれば速度が速い方。誰もいなければ rooms.last_crosser_id
+- Wake Lock
+  - 'wakeLock' in navigator で対応しているか判定する
+  - navigator.wakeLock.request('screen') を try/catch で囲む
+  - visibilitychange で visible に戻ったら取り直す
+- 時刻：表示は端末のローカル時刻。サーバーへは ISO8601（UTC）で送る
+- alert と confirm は使わず、Modal コンポーネントで表示する
+- 画面の切り替えは state で行う。URL は ?room=<code> だけ読み取り、参加の入力を補助する
+
+■8. Cloudflare デプロイ（Workers の静的アセット。Cloudflare が新規プロジェクト向けに案内している方式）
+- wrangler.jsonc
+  {
+    "$schema": "./node_modules/wrangler/config-schema.json",
+    "name": "pit-wall",
+    "compatibility_date": "2026-11-01",
+    "assets": { "directory": "./dist", "not_found_handling": "single-page-application" }
+  }
+  - 静的ファイルだけなので、Worker スクリプト（main）は置かない
+- 環境変数：VITE_SUPABASE_URL と VITE_SUPABASE_PUBLISHABLE_KEY はビルド時に埋め込まれる
+  - ローカルからデプロイするときは .env.local に書く
+  - Git 連携（Workers Builds）を使うときは、ダッシュボードのビルド変数に設定する
+- npm scripts
+  - dev：vite
+  - build：tsc でチェックしてから vite build
+  - test：vitest run
+  - deploy：npm run build を実行してから wrangler deploy
+- 公開URL：https://pit-wall.<account>.workers.dev（HTTPS なので、位置情報と Wake Lock が使える）
+
+■9. 定数（src/config.ts）
+- POS_INTERVAL_MOVING_MS = 5000（走行中の位置送信間隔。測位と判定は端末内で約1秒ごとに行う）
+- POS_INTERVAL_PIT_MS = 10000
+- MAX_ACCURACY_M = 30
+- LINE_EXTEND_M = 15
+- MAX_GAP_SEC = 20
+- MOVING_ON_SEC = 10
+- MOVING_OFF_SEC = 30
+- DISTANCE_FLUSH_SEC = 10
+- STALE_MARKER_SEC = 30
+- TRAIL_SEC = 60
+- LAP_PROVISIONAL_SEC = 15
+- QUICK_BUTTON_COOLDOWN_MS = 2000
+- CHAT_LIMIT = 50
+- QUEUE_RETRY_MS = 15000（送れなかったデータの再送間隔。端末がオンラインに戻ったときにも再送する）
+
+■10. テストと確認
+- 単体テスト（vitest）
+  - geo：距離、平面化
+  - lapDetector：交差する、しない、平行、延長した部分での交差、通過時刻の補間、速度が足りない、間隔が長すぎる
+  - movingState：ヒステリシス、精度による除外、距離の加算、セグメントへのまとめ方
+  - laps：降順の並べ替え、ベストラップ、平均
+  - format：時刻とラップタイムの書式
+- SQL の確認（Supabase の SQL Editor）
+  - get_lap_table の按分とライダー判定を、テスト用のデータで確認する（Aが7割、Bが3割走った周がAになること）
+- 開発用の疑似GPS
+  - ?sim=1：半径約300mの円を約60秒で1周する。円は中心をライン中点からライン方向に半径分ずらして置き、中点でラインを直角に横切るようにする（中点を中心にすると、ラインを横切らないため）
+  - ?sim=1&speed=20：時速20kmで周回する
+  - ?sim=pit：ラインの近くを歩く速度で動く
+- 結合確認（PCでブラウザを2つ開く。別プロファイルにして、別々の匿名ユーザーにする）
+  - 作成 → 参加 → ラインの設定 → レース開始
+  - Aを ?sim=1 にして数周させ、ラップ表とチャットが両方のブラウザに同期することを確認する
+  - 周の途中でAを ?sim=pit、Bを ?sim=1 に切り替える
+    - 「ライダー交代」が表示されること
+    - その周の名前が、走った距離の長い方になること
+    - ピットにいる人はカウントされないこと
+  - 名前の修正（自動に戻すことも含む）、削除、手動追加、再接続したあとの取り直しを確認する
+- 実機確認：workers.dev にデプロイし、スマホ2台で位置の表示と Wake Lock を確認する
+
+■11. 将来の拡張（今回は作らない）
+- 匿名サインインの悪用対策として Cloudflare Turnstile を入れる（Supabase が推奨している）
+- 古い匿名ユーザーとルームの定期削除（今回は cleanup.sql を手動で実行する）
+- 定型ボタンの編集機能
