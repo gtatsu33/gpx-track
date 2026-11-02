@@ -5,7 +5,7 @@ export type QueueJob =
   | { kind: 'crossing'; room: string; t: number }
   | { kind: 'segment'; room: string; user: string; from: number; to: number; meters: number }
 
-const KEY = 'pitwall.queue'
+const KEY = 'gpx-track.queue'
 const MAX_JOBS = 1000
 const MAX_AGE_MS = 12 * 3600 * 1000
 

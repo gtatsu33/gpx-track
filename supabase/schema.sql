@@ -1,5 +1,5 @@
 -- =====================================================================
--- Pit Wall  Supabase スキーマ（APP_VERSION 1.0.0）
+-- gpx-track  Supabase スキーマ（APP_VERSION 1.0.2）
 -- SQL Editor でこのファイルを丸ごと実行する。何度実行しても壊れないように書いている。
 -- 実行後に set_owner_passcode.sql でオーナーパスコードを設定すること。
 -- =====================================================================
@@ -659,8 +659,12 @@ end $$;
 -- Realtime Authorization（private チャネル room:<room_id>）
 -- realtime.messages には ALTER TABLE をかけないこと（RLS は既に有効）
 -- ---------------------------------------------------------------------
+-- 旧名（v1.0.1 まで）のポリシーを削除
 drop policy if exists "pitwall members can receive" on realtime.messages;
-create policy "pitwall members can receive" on realtime.messages
+drop policy if exists "pitwall members can send" on realtime.messages;
+
+drop policy if exists "gpx-track members can receive" on realtime.messages;
+create policy "gpx-track members can receive" on realtime.messages
   for select to authenticated
   using (
     realtime.messages.extension in ('broadcast', 'presence')
@@ -671,8 +675,8 @@ create policy "pitwall members can receive" on realtime.messages
     )
   );
 
-drop policy if exists "pitwall members can send" on realtime.messages;
-create policy "pitwall members can send" on realtime.messages
+drop policy if exists "gpx-track members can send" on realtime.messages;
+create policy "gpx-track members can send" on realtime.messages
   for insert to authenticated
   with check (
     realtime.messages.extension in ('broadcast', 'presence')

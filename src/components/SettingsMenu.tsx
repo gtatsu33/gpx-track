@@ -219,7 +219,7 @@ export function SettingsMenu({ room, isOwner, userName, onClose, onRename, onEdi
         <button className="btn block subtle" onClick={() => setConfirm('leave')}>
           ルームから退出
         </button>
-        <p className="version">Pit Wall v{APP_VERSION}</p>
+        <p className="version">gpx-track v{APP_VERSION}</p>
       </section>
     </Modal>
   )

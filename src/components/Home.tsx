@@ -51,7 +51,7 @@ export function Home({ userName, initialCode, onEnter, onCreate, onReclaim }: Pr
 
   return (
     <div className="page">
-      <h1 className="brand">🏁 Pit Wall</h1>
+      <h1 className="brand">🏁 gpx-track</h1>
       <p className="lead">ようこそ、{userName} さん</p>
 
       <section className="card">

@@ -9,7 +9,7 @@ import { useAuth } from './hooks/useAuth'
 import { supabaseConfigured } from './lib/supabase'
 
 type Screen = 'home' | 'create' | 'reclaim' | 'room'
-const CURRENT_ROOM_KEY = 'pitwall.currentRoom'
+const CURRENT_ROOM_KEY = 'gpx-track.currentRoom'
 
 function readCurrentRoom(): string | null {
   try {

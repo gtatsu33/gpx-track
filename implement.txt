@@ -1,5 +1,5 @@
 耐久レース チーム位置共有アプリ 実装仕様書
-作成日：2026-11-02　対象バージョン：APP_VERSION 1.0.0
+作成日：2026-11-02　対象バージョン：APP_VERSION 1.0.2
 
 ■1. 技術スタック（2026-11-02 に npm registry と公式ドキュメントで確認した安定版）
 - vite 8.3.5
@@ -229,7 +229,7 @@ gpx-track/
 - wrangler.jsonc
   {
     "$schema": "./node_modules/wrangler/config-schema.json",
-    "name": "pit-wall",
+    "name": "gpx-track",
     "compatibility_date": "2026-11-01",
     "assets": { "directory": "./dist", "not_found_handling": "single-page-application" }
   }
@@ -242,7 +242,7 @@ gpx-track/
   - build：tsc でチェックしてから vite build
   - test：vitest run
   - deploy：npm run build を実行してから wrangler deploy
-- 公開URL：https://pit-wall.<account>.workers.dev（HTTPS なので、位置情報と Wake Lock が使える）
+- 公開URL：https://gpx-track.<account>.workers.dev（HTTPS なので、位置情報と Wake Lock が使える）
 
 ■9. 定数（src/config.ts）
 - POS_INTERVAL_MOVING_MS = 5000（走行中の位置送信間隔。測位と判定は端末内で約1秒ごとに行う）

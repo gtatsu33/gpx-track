@@ -23,7 +23,7 @@ export function NameSetup({ onRegister }: { onRegister: (name: string) => Promis
 
   return (
     <div className="page">
-      <h1 className="brand">🏁 Pit Wall</h1>
+      <h1 className="brand">🏁 gpx-track</h1>
       <p className="lead">チームメンバーに表示される名前を入力してください。</p>
       <form
         onSubmit={(e) => {
