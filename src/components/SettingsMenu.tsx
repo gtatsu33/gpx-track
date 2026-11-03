@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toDatetimeLocal } from '../lib/format'
 import { errorText, supabase } from '../lib/supabase'
-import type { Room } from '../lib/types'
+import { riderLabel, type Rider, type Room, type RoomMode } from '../lib/types'
 import { APP_VERSION } from '../version'
 import { ConfirmModal, Modal } from './Modal'
 import { useNotify } from './Notify'
@@ -11,6 +11,10 @@ interface Props {
   isOwner: boolean
   /** この端末の今のライダーの名前 */
   myRiderName: string
+  /** 走らない端末（観戦・運営） */
+  spectator: boolean
+  /** 名簿（個人戦の手動記録で、誰の周かを選ぶ） */
+  riders: Rider[]
   onClose: () => void
   onRiderPick: () => void
   onExport: () => void
@@ -25,6 +29,8 @@ export function SettingsMenu({
   room,
   isOwner,
   myRiderName,
+  spectator,
+  riders,
   onClose,
   onRiderPick,
   onExport,
@@ -39,6 +45,8 @@ export function SettingsMenu({
   const [minLap, setMinLap] = useState(String(room.min_lap_sec))
   const [kmh, setKmh] = useState(String(room.moving_kmh))
   const [confirm, setConfirm] = useState<Confirm>(null)
+  const [manualRider, setManualRider] = useState('')
+  const solo = room.mode === 'solo'
 
   const rpc = async (fn: string, args: Record<string, unknown>, okMsg: string) => {
     const { error } = await supabase.rpc(fn, args)
@@ -105,6 +113,24 @@ export function SettingsMenu({
       </section>
 
       <section className="menu-sec">
+        <label className="switch-row">
+          <input
+            type="checkbox"
+            checked={spectator}
+            onChange={(e) =>
+              void rpc(
+                'set_spectator',
+                { p_room: room.id, p_on: e.target.checked },
+                e.target.checked ? '走らない端末にしました' : '走る端末に戻しました',
+              )
+            }
+          />
+          走らない（観戦・運営）
+        </label>
+        <p className="hint">オンにすると、この端末は位置の送信とラップの計測をしません。ほかの人の位置とチャットは見られます。</p>
+      </section>
+
+      <section className="menu-sec">
         <h3>名前の変更（この端末のライダー）</h3>
         <div className="row">
           <input value={name} maxLength={20} onChange={(e) => setName(e.target.value)} />
@@ -149,6 +175,25 @@ export function SettingsMenu({
 
       {isOwner && (
         <>
+          {room.status === 'ready' && (
+            <section className="menu-sec owner">
+              <h3>オーナー：モード（スタート前だけ変更できます）</h3>
+              <div className="mode-pick">
+                {(['team', 'solo'] as RoomMode[]).map((m) => (
+                  <label key={m} className={room.mode === m ? 'on' : ''}>
+                    <input
+                      type="radio"
+                      name="mode"
+                      checked={room.mode === m}
+                      onChange={() => void rpc('set_room_mode', { p_room: room.id, p_mode: m }, 'モードを変更しました')}
+                    />
+                    {m === 'team' ? '団体戦（リレー）' : '個人戦'}
+                  </label>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section className="menu-sec owner">
             <h3>オーナー：コース</h3>
             <button
@@ -214,6 +259,16 @@ export function SettingsMenu({
                 </div>
                 <div className="field">
                   <span>手動で通過を記録</span>
+                  {solo && (
+                    <select value={manualRider} onChange={(e) => setManualRider(e.target.value)}>
+                      <option value="">誰の周か選んでください</option>
+                      {riders.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {riderLabel(r, room)}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   <div className="row">
                     <input type="datetime-local" step={1} value={manualTime} onChange={(e) => setManualTime(e.target.value)} />
                     <button className="btn" onClick={() => setManualTime(toDatetimeLocal(Date.now()))}>
@@ -224,7 +279,12 @@ export function SettingsMenu({
                       onClick={() => {
                         const d = parseLocal(manualTime)
                         if (!d) return notify('時刻が正しくありません', 'error')
-                        void rpc('add_manual_crossing', { p_room: room.id, p_crossed_at: d.toISOString() }, '通過を記録しました')
+                        if (solo && !manualRider) return notify('誰の周か選んでください', 'error')
+                        void rpc(
+                          'add_manual_crossing',
+                          { p_room: room.id, p_crossed_at: d.toISOString(), p_rider: solo ? manualRider : null },
+                          '通過を記録しました',
+                        )
                       }}
                     >
                       記録

@@ -1,9 +1,11 @@
 // 動作パラメータ（implement.txt ■9）
 
-/** 走行中の位置送信間隔。測位・通過判定・距離計算は端末内で約1秒ごとに行う */
+/** 走行中の位置送信間隔（団体戦）。測位・通過判定・距離計算は端末内で約1秒ごとに行う */
 export const POS_INTERVAL_MOVING_MS = 5000
-/** ピットにいるときの位置送信間隔 */
-export const POS_INTERVAL_PIT_MS = 10000
+/** 走行中の位置送信間隔（個人戦。全員が走るので配信の数を抑える） */
+export const POS_INTERVAL_MOVING_SOLO_MS = 10000
+/** 個人戦のルームに参加できる端末の上限（サーバーの _solo_max_members と同じ値） */
+export const SOLO_MAX_MEMBERS = 15
 /** これより精度が悪い測位は使わない */
 export const MAX_ACCURACY_M = 30
 /** コントロールラインを両端で延長する距離 */

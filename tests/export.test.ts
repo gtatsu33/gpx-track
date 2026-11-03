@@ -18,6 +18,7 @@ const room: Room = {
   line_b_lat: null,
   line_b_lng: null,
   status: 'finished',
+  mode: 'team',
   started_at: at(9, 0),
   finished_at: at(16, 0),
   last_crosser_id: null,
@@ -37,6 +38,7 @@ const lap = (n: number, ms: number, crossed: string, rider: string, name: string
   source: 'gps',
   is_override: false,
   crosser_id: 'u1',
+  rider_lap_no: null,
   ...extra,
 })
 

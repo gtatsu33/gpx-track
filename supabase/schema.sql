@@ -1,5 +1,5 @@
 -- =====================================================================
--- gpx-track  Supabase スキーマ（APP_VERSION 1.2.1）
+-- gpx-track  Supabase スキーマ（APP_VERSION 2.0.0）
 -- SQL Editor でこのファイルを丸ごと実行する。何度実行しても壊れないように書いている。
 -- 実行後に set_owner_passcode.sql でオーナーパスコードを設定すること。
 -- =====================================================================
@@ -59,9 +59,7 @@ create table if not exists public.crossings (
   deleted boolean not null default false,
   created_at timestamptz not null default now()
 );
--- 削除済みの行は重複チェックの対象外にするため、部分ユニークインデックスにする
-create unique index if not exists crossings_room_time_uidx
-  on public.crossings (room_id, crossed_at) where not deleted;
+-- 通過の重複防止の部分ユニークインデックスは、rider_id を追加したあと（下）で作る
 
 create table if not exists public.distance_segments (
   id bigserial primary key,
@@ -103,6 +101,23 @@ alter table public.room_members add column if not exists current_rider_id uuid r
 alter table public.crossings add column if not exists rider_id uuid references public.riders (id) on delete set null;
 alter table public.crossings add column if not exists driver_override_rider_id uuid references public.riders (id) on delete set null;
 alter table public.distance_segments add column if not exists rider_id uuid references public.riders (id) on delete cascade;
+
+-- モード（v2.0.0）：'team' 団体戦（リレー形式） / 'solo' 個人戦。既存のルームは団体戦
+alter table public.rooms add column if not exists mode text not null default 'team';
+alter table public.rooms drop constraint if exists rooms_mode_check;
+alter table public.rooms add constraint rooms_mode_check check (mode in ('team', 'solo'));
+-- 走らない端末（観戦・運営）（v2.0.0）
+alter table public.room_members add column if not exists spectator boolean not null default false;
+
+-- 通過の重複防止はライダーごとにする（個人戦では別の人がほぼ同時に越えても両方記録するため）。
+-- 団体戦で「同時に越えたら片方だけ」は、record_crossing のロックと最小ラップ秒数の確認で守る
+drop index if exists public.crossings_room_time_uidx;
+create unique index if not exists crossings_room_rider_time_uidx
+  on public.crossings (room_id, rider_id, crossed_at) where not deleted;
+
+-- 個人戦のルームに参加できる端末の上限（走らない端末も含む）
+create or replace function public._solo_max_members()
+returns int language sql immutable set search_path = '' as $$ select 15 $$;
 
 -- ---------------------------------------------------------------------
 -- 共通の関数
@@ -443,8 +458,11 @@ begin
   on conflict (id) do update set name = excluded.name, updated_at = now();
 end $$;
 
+-- v1.x の5引数版は削除する（モードの引数を追加したため）
+drop function if exists public.create_room(text, text, int, int, int);
 create or replace function public.create_room(
-  p_passcode text, p_team_name text, p_duration_min int, p_min_lap_sec int, p_moving_kmh int
+  p_passcode text, p_team_name text, p_duration_min int, p_min_lap_sec int, p_moving_kmh int,
+  p_mode text default 'team'
 )
 returns jsonb
 language plpgsql security definer set search_path = ''
@@ -459,9 +477,10 @@ begin
   perform public._check_passcode(p_passcode);
   select name into pname from public.profiles where id = uid;
   if pname is null then raise exception 'no_profile'; end if;
-  insert into public.rooms (code, team_name, owner_id, duration_min, min_lap_sec, moving_kmh)
+  if coalesce(p_mode, 'team') not in ('team', 'solo') then raise exception 'invalid_mode'; end if;
+  insert into public.rooms (code, team_name, owner_id, duration_min, min_lap_sec, moving_kmh, mode)
   values (public._gen_room_code(), btrim(p_team_name), uid, p_duration_min,
-          coalesce(p_min_lap_sec, 30), coalesce(p_moving_kmh, 15))
+          coalesce(p_min_lap_sec, 30), coalesce(p_moving_kmh, 15), coalesce(p_mode, 'team'))
   returning * into r;
   -- 作った人の本人のライダーを、オーナーのライダーにする
   insert into public.riders (room_id, name, user_id) values (r.id, pname, uid) returning id into rid;
@@ -482,6 +501,12 @@ begin
   if not exists (select 1 from public.profiles where id = uid) then raise exception 'no_profile'; end if;
   select id into rid from public.rooms where code = upper(btrim(p_code));
   if rid is null then raise exception 'room_not_found'; end if;
+  -- 個人戦は端末数に上限がある（参加済みの端末はそのまま入れる）
+  if (select mode from public.rooms where id = rid) = 'solo'
+     and not exists (select 1 from public.room_members where room_id = rid and user_id = uid)
+     and (select count(*) from public.room_members where room_id = rid) >= public._solo_max_members() then
+    raise exception 'room_full';
+  end if;
   insert into public.room_members (room_id, user_id, color_idx)
   values (rid, uid, (select coalesce(max(color_idx) + 1, 0) from public.room_members where room_id = rid))
   on conflict (room_id, user_id) do nothing;
@@ -570,6 +595,30 @@ begin
     raise exception 'duplicate_name';
   end if;
   update public.riders set name = n where id = rid and name <> n;
+end $$;
+
+-- モードの変更［オーナー］。スタート前だけ
+create or replace function public.set_room_mode(p_room uuid, p_mode text)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare r public.rooms;
+begin
+  r := public._require_owner(p_room);
+  if r.status <> 'ready' then raise exception 'invalid_status'; end if;
+  if p_mode not in ('team', 'solo') then raise exception 'invalid_mode'; end if;
+  update public.rooms set mode = p_mode where id = p_room and mode <> p_mode;
+end $$;
+
+-- この端末を「走らない（観戦・運営）」にする／戻す［メンバー］
+create or replace function public.set_spectator(p_room uuid, p_on boolean)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+begin
+  if auth.uid() is null or not public.is_room_member(p_room) then raise exception 'not_member'; end if;
+  update public.room_members set spectator = coalesce(p_on, false)
+   where room_id = p_room and user_id = auth.uid() and spectator is distinct from coalesce(p_on, false);
 end $$;
 
 create or replace function public.set_line(p_room uuid, p_a_lat double precision, p_a_lng double precision,
@@ -676,6 +725,11 @@ begin
   select * into r from public.rooms where id = p_room for update;
   if r.status <> 'running' then return 'not_running'; end if;
 
+  -- 走らない端末（観戦・運営）からの通過は記録しない
+  if exists (select 1 from public.room_members where room_id = p_room and user_id = uid and spectator) then
+    return 'spectator';
+  end if;
+
   if exists (select 1 from public.crossings
              where room_id = p_room and crosser_id = uid and crossed_at = p_crossed_at and not deleted) then
     return 'duplicate';
@@ -685,20 +739,25 @@ begin
     return 'out_of_range';
   end if;
 
-  -- レース開始時刻と前後の通過から、最小ラップ秒数以上離れていること
-  if p_crossed_at - r.started_at < make_interval(secs => r.min_lap_sec)
-     or exists (select 1 from public.crossings
-                where room_id = p_room and not deleted
-                  and crossed_at > p_crossed_at - make_interval(secs => r.min_lap_sec)
-                  and crossed_at < p_crossed_at + make_interval(secs => r.min_lap_sec)) then
-    return 'too_soon';
-  end if;
-
   if p_rider is not null and exists (select 1 from public.riders where id = p_rider and room_id = p_room) then
     rider := p_rider;
   else
     rider := public._current_rider(p_room, uid);
   end if;
+  -- 個人戦は周回をライダーごとに数えるので、ライダーが決まらない通過は記録しない
+  if r.mode = 'solo' and rider is null then return 'no_rider'; end if;
+
+  -- レース開始時刻と前後の通過から、最小ラップ秒数以上離れていること
+  -- 団体戦はチームのすべての通過、個人戦は本人（その周のライダー）の通過と比べる
+  if p_crossed_at - r.started_at < make_interval(secs => r.min_lap_sec)
+     or exists (select 1 from public.crossings x
+                where x.room_id = p_room and not x.deleted
+                  and (r.mode = 'team' or coalesce(x.driver_override_rider_id, x.rider_id) = rider)
+                  and x.crossed_at > p_crossed_at - make_interval(secs => r.min_lap_sec)
+                  and x.crossed_at < p_crossed_at + make_interval(secs => r.min_lap_sec)) then
+    return 'too_soon';
+  end if;
+
   select coalesce((select name from public.riders where id = rider),
                   (select name from public.profiles where id = uid)) into uname;
   select rider_id into prev_rider from public.crossings
@@ -714,14 +773,19 @@ begin
 
   perform public._refresh_last_crosser(p_room);
 
-  if prev_rider is not null and rider is not null and prev_rider <> rider then
+  -- ライダー交代のメッセージは団体戦だけ
+  if r.mode = 'team' and prev_rider is not null and rider is not null and prev_rider <> rider then
     perform public._post_system_message(p_room, 'ライダー交代：' || coalesce(uname, '?'));
   end if;
 
   return 'recorded';
 end $$;
 
-create or replace function public.add_manual_crossing(p_room uuid, p_crossed_at timestamptz)
+-- v1.x の2引数版は削除する（個人戦で誰の周かを指定する引数を追加したため）
+drop function if exists public.add_manual_crossing(uuid, timestamptz);
+
+-- p_rider：個人戦では必須（誰の周か）。団体戦では使わない（直前に通過したライダーにする）
+create or replace function public.add_manual_crossing(p_room uuid, p_crossed_at timestamptz, p_rider uuid default null)
 returns void
 language plpgsql security definer set search_path = ''
 as $$
@@ -736,12 +800,30 @@ begin
   if p_crossed_at <= r.started_at or p_crossed_at > now() + interval '5 seconds' then
     raise exception 'invalid_time';
   end if;
-  -- その時刻の直前に通過したライダー（いなければ最後に通過したライダー、さらにいなければオーナーのライダー）
-  select crosser_id, rider_id into cid, crid from public.crossings
-   where room_id = p_room and not deleted and crossed_at < p_crossed_at
-   order by crossed_at desc limit 1;
-  cid := coalesce(cid, r.last_crosser_id, auth.uid());
-  crid := coalesce(crid, r.last_crosser_rider_id, r.owner_rider_id);
+  if r.mode = 'solo' then
+    if p_rider is null or not exists (select 1 from public.riders where id = p_rider and room_id = p_room) then
+      raise exception 'not_rider';
+    end if;
+    crid := p_rider;
+    cid := auth.uid();
+    -- 同じ人の同じ時刻の通過は記録しない
+    if exists (select 1 from public.crossings
+               where room_id = p_room and not deleted and crossed_at = p_crossed_at
+                 and coalesce(driver_override_rider_id, rider_id) = crid) then
+      raise exception 'duplicate_time';
+    end if;
+  else
+    -- その時刻の直前に通過したライダー（いなければ最後に通過したライダー、さらにいなければオーナーのライダー）
+    select crosser_id, rider_id into cid, crid from public.crossings
+     where room_id = p_room and not deleted and crossed_at < p_crossed_at
+     order by crossed_at desc limit 1;
+    cid := coalesce(cid, r.last_crosser_id, auth.uid());
+    crid := coalesce(crid, r.last_crosser_rider_id, r.owner_rider_id);
+    -- 団体戦はチームで1周なので、同じ時刻の通過があれば記録しない
+    if exists (select 1 from public.crossings where room_id = p_room and not deleted and crossed_at = p_crossed_at) then
+      raise exception 'duplicate_time';
+    end if;
+  end if;
   select coalesce((select name from public.riders where id = crid),
                   (select name from public.profiles where id = cid)) into cname;
   begin
@@ -786,10 +868,14 @@ begin
 end $$;
 
 -- ラップ表（周番号・ラップタイム・ライダーをサーバー側で計算）
--- p_from：この周以降の行だけを返す（通信量を抑えるため。省略すると全周）
--- v1.2.0 までの1引数版は削除する（引数の数が違う関数が並ぶと、呼び出しがあいまいになるため）
+-- p_from：この通し番号以降の行だけを返す（通信量を抑えるため。省略すると全周）
+-- lap_no は全体の通し番号（通過時刻の順）。両方のモードで同じ
+-- rider_lap_no は個人戦での本人の周番号（団体戦では null）
+-- lap_ms は、団体戦はチームの前の通過から、個人戦は本人の前の通過から（1周目は開始時刻から）
+-- v1.2.0 までの1引数版と、戻り値の列が変わる前の版を削除する
 drop function if exists public.get_lap_table(uuid);
-create or replace function public.get_lap_table(p_room uuid, p_from int default 1)
+drop function if exists public.get_lap_table(uuid, int);
+create function public.get_lap_table(p_room uuid, p_from int default 1)
 returns table (
   lap_no int,
   crossing_id uuid,
@@ -800,22 +886,37 @@ returns table (
   driver_meters double precision,
   source text,
   is_override boolean,
-  crosser_id uuid
+  crosser_id uuid,
+  rider_lap_no int
 )
 language plpgsql stable security definer set search_path = ''
 as $$
 #variable_conflict use_column
+declare
+  solo boolean;
+  started timestamptz;
 begin
   if not public.is_room_member(p_room) then raise exception 'not_member'; end if;
+  select r.mode = 'solo', r.started_at into solo, started from public.rooms r where r.id = p_room;
   return query
-  -- driver_id はライダー（riders.id）。走行距離もライダーごとに集計する
-  with c as (
+  -- driver_id はライダー（riders.id）。団体戦は走行距離をライダーごとに集計して決める
+  with base as (
     select x.id, x.crossed_at, x.crosser_id, x.crosser_name, x.source, x.rider_id, x.driver_override_rider_id,
-           row_number() over (order by x.crossed_at)::int as n,
-           coalesce(lag(x.crossed_at) over (order by x.crossed_at),
-                    (select r.started_at from public.rooms r where r.id = p_room)) as lap_start
+           coalesce(x.driver_override_rider_id, x.rider_id) as eff
     from public.crossings x
     where x.room_id = p_room and not x.deleted
+  ),
+  c as (
+    select base.*,
+           row_number() over (order by base.crossed_at)::int as n,
+           case when solo
+                then row_number() over (partition by base.eff order by base.crossed_at)::int
+           end as rn,
+           case when solo
+                then coalesce(lag(base.crossed_at) over (partition by base.eff order by base.crossed_at), started)
+                else coalesce(lag(base.crossed_at) over (order by base.crossed_at), started)
+           end as lap_start
+    from base
   ),
   d as (
     select c.id as cid, s.rider_id,
@@ -827,6 +928,7 @@ begin
     join public.distance_segments s
       on s.room_id = p_room and s.rider_id is not null and s.t_to > c.lap_start and s.t_from < c.crossed_at
     where c.n >= coalesce(p_from, 1) -- 走行距離の集計は返す周の分だけ行う
+      and not solo                   -- 個人戦はライダーが通過で決まるので集計しない
     group by c.id, s.rider_id
   ),
   best as (
@@ -836,7 +938,9 @@ begin
     order by d.cid, d.m desc, (d.rider_id = c.rider_id) desc
   ),
   pick as (
-    select c.*, coalesce(c.driver_override_rider_id, best.rider_id, c.rider_id) as drv
+    select c.*,
+           case when solo then c.eff
+                else coalesce(c.driver_override_rider_id, best.rider_id, c.rider_id) end as drv
     from c left join best on best.cid = c.id
   )
   select pick.n,
@@ -848,7 +952,8 @@ begin
          dm.m,
          pick.source,
          pick.driver_override_rider_id is not null,
-         pick.crosser_id
+         pick.crosser_id,
+         pick.rn
   from pick
   left join public.riders rd on rd.id = pick.drv
   left join d dm on dm.cid = pick.id and dm.rider_id = pick.drv
@@ -916,10 +1021,11 @@ begin
       '_gen_room_code', '_check_passcode', '_messages_fill_name', '_bc_rooms', '_bc_crossings',
       '_bc_messages', '_bc_members', '_bc_profiles', '_refresh_last_crosser',
       '_unique_rider_name', '_assign_own_rider', '_current_rider', '_segments_fill_rider', '_bc_riders',
+      '_solo_max_members',
       'update_profile_name', 'create_room', 'join_room', 'reclaim_owner', 'set_line',
       'update_room_settings', 'start_race', 'set_start_time', 'finish_race', 'record_crossing',
       'add_manual_crossing', 'delete_crossing', 'set_crossing_driver', 'get_lap_table',
-      'switch_rider', 'add_rider', 'rename_rider')
+      'switch_rider', 'add_rider', 'rename_rider', 'set_room_mode', 'set_spectator')
   loop
     execute format('revoke all on function %s from public, anon', f.sig);
     if f.proname not like '\_%' then

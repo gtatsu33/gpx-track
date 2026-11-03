@@ -13,6 +13,7 @@ const row = (n: number, ms: number, at: string, over = false): LapRow => ({
   source: 'gps',
   is_override: over,
   crosser_id: 'u1',
+  rider_lap_no: null,
 })
 
 describe('buildLapView', () => {

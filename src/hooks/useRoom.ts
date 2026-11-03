@@ -25,12 +25,16 @@ export function useRoom(roomId: string, userId: string, userName: string) {
   const [connected, setConnected] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
+  const roomRef = useRef<Room | null>(null)
 
   const loadRoom = useCallback(async () => {
     const { data, error } = await supabase.from('rooms').select('*').eq('id', roomId).maybeSingle()
     if (error) return
     if (!data) setLoadError('ルームが見つからないか、メンバーではありません')
-    else setRoom(data as Room)
+    else {
+      roomRef.current = data as Room
+      setRoom(data as Room)
+    }
   }, [roomId])
 
   /** 端末（メンバー）と名簿（ライダー）をまとめて取り直す */
@@ -38,7 +42,7 @@ export function useRoom(roomId: string, userId: string, userName: string) {
     const [mRes, rRes] = await Promise.all([
       supabase
         .from('room_members')
-        .select('user_id, color_idx, current_rider_id, profiles(name)')
+        .select('user_id, color_idx, current_rider_id, spectator, profiles(name)')
         .eq('room_id', roomId)
         .order('joined_at'),
       supabase.from('riders').select('id, name, user_id').eq('room_id', roomId).order('created_at'),
@@ -53,12 +57,14 @@ export function useRoom(roomId: string, userId: string, userName: string) {
           user_id: string
           color_idx: number
           current_rider_id: string | null
+          spectator: boolean
           profiles: { name: string } | null
         }[]
       ).map((m) => ({
         user_id: m.user_id,
         color_idx: m.color_idx,
         rider_id: m.current_rider_id,
+        spectator: m.spectator,
         name: (m.current_rider_id && riderName.get(m.current_rider_id)) || m.profiles?.name || '?',
       })),
     )
@@ -164,7 +170,9 @@ export function useRoom(roomId: string, userId: string, userName: string) {
           // 最後に追加された通過なら後ろだけ、それ以外（削除・名前の修正・過去の時刻への追加・開始時刻の修正）は全部
           void (canLoadLapTail(lapsRef.current, ev) ? loadLapsTail() : loadLaps())
           // 遅れて届く走行距離でライダーを確定させるため、少し後に最後の周をもう一度取得
-          timers.push(window.setTimeout(() => void loadLapsTail(), (LAP_PROVISIONAL_SEC + 1) * 1000))
+          // （個人戦はライダーが通過で決まるので不要）
+          if (roomRef.current?.mode !== 'solo')
+            timers.push(window.setTimeout(() => void loadLapsTail(), (LAP_PROVISIONAL_SEC + 1) * 1000))
         })
         .on('broadcast', { event: 'room' }, () => void loadRoom())
         .on('broadcast', { event: 'member' }, () => void loadMembers())

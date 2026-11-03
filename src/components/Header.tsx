@@ -13,6 +13,10 @@ interface Props {
   /** この端末の今のライダー */
   myRiderName: string
   isOwner: boolean
+  /** 走らない端末（観戦・運営） */
+  spectator: boolean
+  /** 個人戦の表示（例：「自分：3位　12周　+0:12.3」「トップ：佐藤 12周」） */
+  soloText: string
   onRiderPick: () => void
   wake: WakeLockStatus
   geo: GeoStatus
@@ -40,17 +44,27 @@ export function Header(p: Props) {
         <span className="clock">{raceClock(p.room, p.now)}</span>
       </div>
       <div className="hdr-row">
-        <span className="laps">
-          <b>{p.lapCount}</b>周
-        </span>
-        <button className="rider" onClick={p.onRiderPick} aria-label="この端末のライダーを切り替え">
-          <span className="rider-now">
-            🚴 {p.riderName ?? '—'}
-            {p.meMoving && <span className="badge">{p.riderIsMe ? '走行中' : '自分:走行中'}</span>}
+        {p.room.mode === 'team' && (
+          <span className="laps">
+            <b>{p.lapCount}</b>周
           </span>
+        )}
+        <button className="rider" onClick={p.onRiderPick} aria-label="この端末のライダーを切り替え">
+          {p.room.mode === 'solo' ? (
+            <span className="rider-now">
+              {p.soloText}
+              {p.meMoving && <span className="badge">走行中</span>}
+            </span>
+          ) : (
+            <span className="rider-now">
+              🚴 {p.riderName ?? '—'}
+              {p.meMoving && <span className="badge">{p.riderIsMe ? '走行中' : '自分:走行中'}</span>}
+            </span>
+          )}
           <span className="rider-me">
             この端末：{p.myRiderName}
             {p.isOwner && <span className="owner-tag">オーナー</span>}
+            {p.spectator && <span className="spec-tag">観戦中</span>}
           </span>
         </button>
         <span className="hdr-icons">

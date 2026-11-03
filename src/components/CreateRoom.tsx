@@ -1,5 +1,7 @@
 import { useState } from 'react'
+import { SOLO_MAX_MEMBERS } from '../config'
 import { errorText, supabase } from '../lib/supabase'
+import type { RoomMode } from '../lib/types'
 import { useNotify } from './Notify'
 
 interface Props {
@@ -8,6 +10,7 @@ interface Props {
 }
 
 export function CreateRoom({ onBack, onEnter }: Props) {
+  const [mode, setMode] = useState<RoomMode>('team')
   const [passcode, setPasscode] = useState('')
   const [team, setTeam] = useState('')
   const [hours, setHours] = useState('')
@@ -24,7 +27,8 @@ export function CreateRoom({ onBack, onEnter }: Props) {
     const sp = Number(kmh)
     const dur = (Number(hours) || 0) * 60 + (Number(minutes) || 0)
     if (!passcode) return notify('オーナーパスコードを入力してください', 'error')
-    if (!teamName || teamName.length > 30) return notify('チーム名は1〜30文字です', 'error')
+    const nameLabel = mode === 'solo' ? 'ルーム名' : 'チーム名'
+    if (!teamName || teamName.length > 30) return notify(`${nameLabel}は1〜30文字です`, 'error')
     if (!(ml >= 10 && ml <= 600)) return notify('最小ラップ秒数は10〜600です', 'error')
     if (!(sp >= 3 && sp <= 100)) return notify('判定速度は3〜100km/hです', 'error')
     setBusy(true)
@@ -34,6 +38,7 @@ export function CreateRoom({ onBack, onEnter }: Props) {
       p_duration_min: dur > 0 ? dur : null,
       p_min_lap_sec: Math.round(ml),
       p_moving_kmh: Math.round(sp),
+      p_mode: mode,
     })
     setBusy(false)
     if (error) notify(errorText(error), 'error')
@@ -79,12 +84,28 @@ export function CreateRoom({ onBack, onEnter }: Props) {
           void submit()
         }}
       >
+        <div className="field">
+          <span>モード</span>
+          <div className="mode-pick">
+            {(['team', 'solo'] as RoomMode[]).map((m) => (
+              <label key={m} className={mode === m ? 'on' : ''}>
+                <input type="radio" name="mode" checked={mode === m} onChange={() => setMode(m)} />
+                {m === 'team' ? '団体戦（リレー形式）' : '個人戦'}
+              </label>
+            ))}
+          </div>
+          <small className="hint">
+            {mode === 'team'
+              ? 'チームの1人が交代で走り、チームで通算した周回数を競います。'
+              : `参加者全員が同時に走り、1人ずつの周回数と順位を競います（${SOLO_MAX_MEMBERS}台まで）。`}
+          </small>
+        </div>
         <label className="field">
           <span>オーナーパスコード</span>
           <input type="password" value={passcode} onChange={(e) => setPasscode(e.target.value)} />
         </label>
         <label className="field">
-          <span>チーム名（1〜30文字）</span>
+          <span>{mode === 'solo' ? 'ルーム名（大会名など。1〜30文字）' : 'チーム名（1〜30文字）'}</span>
           <input value={team} maxLength={30} onChange={(e) => setTeam(e.target.value)} />
         </label>
         <div className="field">

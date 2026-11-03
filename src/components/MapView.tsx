@@ -17,6 +17,12 @@ interface Props {
   editing: boolean
   onSaveLine: (line: ControlLine) => void
   onCancelEdit: () => void
+  /** マーカーの名前ラベル（個人戦は「名前 周回数」）。省略時は名前だけ */
+  labelOf?: (m: Member) => string
+  /** 追従ボタンの文言（団体戦「ライダー追従」、個人戦「自分を追従」） */
+  followLabel?: string
+  /** 追従の初期値 */
+  initialFollow?: boolean
 }
 
 const esc = (s: string) =>
@@ -88,7 +94,7 @@ function LineEditor(props: { points: LatLng[]; onTap: (p: LatLng) => void }) {
 }
 
 export function MapView(p: Props) {
-  const [follow, setFollow] = useState(true)
+  const [follow, setFollow] = useState(p.initialFollow ?? true)
   const [fitTick, setFitTick] = useState(0)
   const [editPts, setEditPts] = useState<LatLng[]>([])
 
@@ -148,14 +154,14 @@ export function MapView(p: Props) {
 
         {Object.values(p.positions).map((pos) => {
           const m = memberById.get(pos.uid)
-          if (!m) return null
+          if (!m || m.spectator) return null // 走らない端末は表示しない
           const stale = p.now - pos.receivedAt > STALE_MARKER_SEC * 1000 || !p.online.has(pos.uid)
           const kind = stale ? 'stale' : pos.uid === p.riderId ? 'rider' : pos.moving ? 'moving' : 'normal'
           return (
             <MemberMarker
               key={pos.uid}
               pos={pos}
-              name={m.name}
+              name={p.labelOf ? p.labelOf(m) : m.name}
               color={MEMBER_COLORS[m.color_idx % MEMBER_COLORS.length]}
               kind={kind}
             />
@@ -171,7 +177,7 @@ export function MapView(p: Props) {
             全員表示
           </button>
           <button className={`map-btn ${follow ? 'on' : ''}`} onClick={() => setFollow((f) => !f)}>
-            ライダー追従 {follow ? 'ON' : 'OFF'}
+            {p.followLabel ?? 'ライダー追従'} {follow ? 'ON' : 'OFF'}
           </button>
         </div>
       )}

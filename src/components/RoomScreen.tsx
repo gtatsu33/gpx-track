@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { STALE_MARKER_SEC } from '../config'
 import { errorText, supabase } from '../lib/supabase'
-import { roomLine, type ControlLine } from '../lib/types'
+import { computeStandings, formatGap, lapCountByRider } from '../lib/standings'
+import { roomLine, type ControlLine, type Member } from '../lib/types'
 import { useRoom } from '../hooks/useRoom'
 import { useTracker } from '../hooks/useTracker'
 import { useWakeLock } from '../hooks/useWakeLock'
@@ -14,6 +15,7 @@ import { Modal } from './Modal'
 import { RiderPicker } from './RiderPicker'
 import { useNotify } from './Notify'
 import { SettingsMenu } from './SettingsMenu'
+import { StandingsTable } from './StandingsTable'
 
 interface Props {
   roomId: string
@@ -39,6 +41,7 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
 
   const me = members.find((m) => m.user_id === userId)
   const myRiderId = me?.rider_id ?? null
+  const spectator = me?.spectator ?? false
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
@@ -56,6 +59,7 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
     room,
     userId,
     riderId: myRiderId,
+    spectator,
     sendPos: data.sendPos,
     setOwnPos: data.setOwnPos,
     onCrossing,
@@ -90,6 +94,27 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
     ? riderNameOf(movingNow[0].rid) ?? members.find((m) => m.user_id === movingNow[0].uid)?.name ?? null
     : riderNameOf(room.last_crosser_rider_id)
 
+  // 個人戦：順位とヘッダーの表示、マップのラベル（名前 周回数）
+  const solo = room.mode === 'solo'
+  let soloText = ''
+  let labelOf: ((m: Member) => string) | undefined
+  if (solo) {
+    const standings = computeStandings(laps, { riders, ownerRiderId: room.owner_rider_id })
+    const mine = standings.find((s) => s.riderId != null && s.riderId === myRiderId)
+    const top = standings[0]
+    if (!spectator) {
+      soloText = mine
+        ? `自分：${mine.position}位　${mine.laps}周　${formatGap(mine.gap)}`
+        : '自分：0周'
+    } else {
+      soloText = top ? `トップ：${top.name} ${top.laps}周` : 'トップ：—'
+    }
+    const counts = lapCountByRider(laps)
+    labelOf = (m) => `${m.name} ${m.rider_id ? counts.get(m.rider_id) ?? 0 : 0}`
+  }
+  // 地図で強調する端末：団体戦は現在のライダー、個人戦は自分（走らない端末なら誰も強調しない）
+  const highlightId = solo ? (spectator ? null : userId) : riderId
+
   const saveLine = async (line: ControlLine) => {
     const { error } = await supabase.rpc('set_line', {
       p_room: room.id,
@@ -122,6 +147,8 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
         riderIsMe={riderId === userId}
         myRiderName={myRiderName}
         isOwner={isOwner}
+        spectator={spectator}
+        soloText={soloText}
         onRiderPick={() => setPicking(true)}
         meMoving={moving}
         wake={wake}
@@ -136,7 +163,7 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
           マップ
         </button>
         <button className={tab === 'laps' ? 'active' : ''} onClick={() => setTab('laps')}>
-          ラップ
+          {solo ? '順位' : 'ラップ'}
         </button>
       </nav>
       <main className="content">
@@ -145,22 +172,38 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
           members={members}
           positions={positions}
           online={online}
-          riderId={riderId}
+          riderId={highlightId}
+          labelOf={labelOf}
+          followLabel={solo ? '自分を追従' : 'ライダー追従'}
+          initialFollow={!(solo && spectator)}
           line={roomLine(room)}
           now={now}
           editing={editingLine}
           onSaveLine={(l) => void saveLine(l)}
           onCancelEdit={() => setEditingLine(false)}
         />
-        <LapTable
-          visible={tab === 'laps'}
-          laps={laps}
-          now={now}
-          isOwner={isOwner}
-          room={room}
-          riders={riders}
-          onChanged={() => void data.loadLaps()}
-        />
+        {solo ? (
+          <StandingsTable
+            visible={tab === 'laps'}
+            laps={laps}
+            room={room}
+            riders={riders}
+            members={members}
+            myRiderId={myRiderId}
+            isOwner={isOwner}
+            onChanged={() => void data.loadLaps()}
+          />
+        ) : (
+          <LapTable
+            visible={tab === 'laps'}
+            laps={laps}
+            now={now}
+            isOwner={isOwner}
+            room={room}
+            riders={riders}
+            onChanged={() => void data.loadLaps()}
+          />
+        )}
       </main>
       <ChatArea messages={messages} />
       <QuickButtons roomId={room.id} userId={userId} />
@@ -170,6 +213,8 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
           room={room}
           isOwner={isOwner}
           myRiderName={myRiderName}
+          spectator={spectator}
+          riders={riders}
           onClose={() => setSettings(false)}
           onRiderPick={() => {
             setSettings(false)

@@ -8,12 +8,13 @@ import {
   MOVING_OFF_SEC,
   MOVING_ON_SEC,
   POS_INTERVAL_MOVING_MS,
-  POS_INTERVAL_PIT_MS,
+  POS_INTERVAL_MOVING_SOLO_MS,
   QUEUE_RETRY_MS,
 } from '../config'
 import { flushQueue, sendOrQueue } from '../lib/crossingQueue'
 import { LapDetector, kmhToMps } from '../lib/lapDetector'
 import { MovingTracker } from '../lib/movingState'
+import { shouldSendPos, type PosSendState } from '../lib/posPolicy'
 import { roomLine, type Fix, type PosPayload, type Room } from '../lib/types'
 import { useGeolocation } from './useGeolocation'
 
@@ -22,12 +23,14 @@ interface Options {
   userId: string
   /** この端末の今のライダー */
   riderId: string | null
+  /** 走らない端末（観戦・運営）。GPS・位置の送信・通過の判定・走行距離の記録をすべて止める */
+  spectator: boolean
   sendPos: (p: PosPayload) => void
   setOwnPos: (p: PosPayload) => void
   onCrossing?: (result: string) => void
 }
 
-export function useTracker({ room, userId, riderId, sendPos, setOwnPos, onCrossing }: Options) {
+export function useTracker({ room, userId, riderId, spectator, sendPos, setOwnPos, onCrossing }: Options) {
   const [moving, setMoving] = useState(false)
   const [lastFix, setLastFix] = useState<Fix | null>(null)
 
@@ -40,7 +43,7 @@ export function useTracker({ room, userId, riderId, sendPos, setOwnPos, onCrossi
       offSec: MOVING_OFF_SEC,
     }),
   )
-  const lastSentAt = useRef(0)
+  const sendState = useRef<PosSendState>({ lastSentAt: null, lastSentMoving: null })
   const roomRef = useRef(room)
   roomRef.current = room
   const riderRef = useRef(riderId)
@@ -72,7 +75,7 @@ export function useTracker({ room, userId, riderId, sendPos, setOwnPos, onCrossi
       void sendOrQueue({ kind: 'crossing', room: r.id, t, rider: riderRef.current }).then((res) => cbRef.current.onCrossing?.(res))
     }
 
-    // 位置の送信（走行中5秒 / ピット10秒ごと）
+    // 位置の送信：走行中は団体戦5秒・個人戦10秒ごと。ピットの間は送らない（ピットになったときに1回だけ送る）
     const payload: PosPayload = {
       uid: userId,
       rid: riderRef.current,
@@ -83,17 +86,24 @@ export function useTracker({ room, userId, riderId, sendPos, setOwnPos, onCrossi
       moving: isMoving,
       t: fix.t,
     }
-    const interval = isMoving ? POS_INTERVAL_MOVING_MS : POS_INTERVAL_PIT_MS
+    const interval = r.mode === 'solo' ? POS_INTERVAL_MOVING_SOLO_MS : POS_INTERVAL_MOVING_MS
     const now = Date.now()
-    if (now - lastSentAt.current >= interval) {
-      lastSentAt.current = now
+    if (shouldSendPos(sendState.current, isMoving, now, interval)) {
+      sendState.current = { lastSentAt: now, lastSentMoving: isMoving }
       cbRef.current.sendPos(payload)
     } else {
       cbRef.current.setOwnPos(payload)
     }
   }
 
-  const geoStatus = useGeolocation(Boolean(room), line, handleFix)
+  const geoStatus = useGeolocation(Boolean(room) && !spectator, line, handleFix)
+
+  // 走らない端末から戻ったときは、判定と送信の状態を最初からにする
+  useEffect(() => {
+    detector.current.reset()
+    sendState.current = { lastSentAt: null, lastSentMoving: null }
+    setMoving(false)
+  }, [spectator])
 
   // ライン変更時は判定器をリセット
   const lineKey = line ? `${line.a.lat},${line.a.lng},${line.b.lat},${line.b.lng}` : ''
@@ -105,7 +115,8 @@ export function useTracker({ room, userId, riderId, sendPos, setOwnPos, onCrossi
   const flushDistance = (rider: string | null) => {
     const seg = tracker.current.flush()
     const r = roomRef.current
-    if (!seg || !r || r.status !== 'running') return
+    // 個人戦はライダーが通過で決まるので、走行距離は送らない
+    if (!seg || !r || r.status !== 'running' || r.mode === 'solo') return
     void sendOrQueue({ kind: 'segment', room: r.id, user: userId, rider, from: seg.from, to: seg.to, meters: seg.meters })
   }
   const flushRef = useRef(flushDistance)

@@ -18,6 +18,8 @@ export interface ControlLine {
 }
 
 export type RoomStatus = 'ready' | 'running' | 'finished'
+/** team：団体戦（リレー形式） / solo：個人戦 */
+export type RoomMode = 'team' | 'solo'
 
 export interface Room {
   id: string
@@ -32,6 +34,7 @@ export interface Room {
   line_b_lat: number | null
   line_b_lng: number | null
   status: RoomStatus
+  mode: RoomMode
   started_at: string | null
   finished_at: string | null
   last_crosser_id: string | null
@@ -57,6 +60,8 @@ export interface Member {
   rider_id: string | null
   /** 今のライダーの名前（なければプロフィールの名前） */
   name: string
+  /** 走らない端末（観戦・運営） */
+  spectator: boolean
 }
 
 export interface ChatMessage {
@@ -82,6 +87,8 @@ export interface LapRow {
   source: 'gps' | 'manual'
   is_override: boolean
   crosser_id: string | null
+  /** 個人戦での本人の周番号（団体戦では null）。lap_no は全体の通し番号 */
+  rider_lap_no: number | null
 }
 
 /** メンバー間で共有する位置（broadcast pos） */

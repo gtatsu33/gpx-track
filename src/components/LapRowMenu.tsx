@@ -16,6 +16,9 @@ interface Props {
 
 /** オーナー用：周の削除・名前の修正（名簿から選ぶ） */
 export function LapRowMenu({ lap, room, riders, onClose, onDone }: Props) {
+  // 個人戦は本人の周番号で表示し、「名前の修正」は「別の人の周への付け替え」になる
+  const solo = room.mode === 'solo'
+  const label = solo ? `${lap.driver_name} 第${lap.rider_lap_no ?? '?'}周` : `第${lap.lap_no}周`
   const [confirmDelete, setConfirmDelete] = useState(false)
   const notify = useNotify()
 
@@ -32,7 +35,7 @@ export function LapRowMenu({ lap, room, riders, onClose, onDone }: Props) {
     return (
       <ConfirmModal
         title="周の削除"
-        message={`第${lap.lap_no}周（${formatClock(lap.crossed_at)}）を削除します。以降の周番号とラップタイムは再計算されます。`}
+        message={`${label}（${formatClock(lap.crossed_at)}）を削除します。以降の周番号とラップタイムは再計算されます。`}
         okLabel="削除"
         danger
         onCancel={() => setConfirmDelete(false)}
@@ -42,8 +45,8 @@ export function LapRowMenu({ lap, room, riders, onClose, onDone }: Props) {
   }
 
   return (
-    <Modal title={`第${lap.lap_no}周  ${formatLap(lap.lap_ms)}`} onClose={onClose}>
-      <h3>名前の修正</h3>
+    <Modal title={`${label}  ${formatLap(lap.lap_ms)}`} onClose={onClose}>
+      <h3>{solo ? '別の人の周に付け替え' : '名前の修正'}</h3>
       <div className="member-pick">
         {riders.map((r) => (
           <button

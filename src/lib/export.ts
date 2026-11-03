@@ -1,6 +1,7 @@
 // レース結果の出力：CSV と共有テキストを作る（純粋関数。spec.txt 3.10）
 import { formatDuration, formatLap, toDatetimeLocal } from './format'
 import { buildLapView } from './laps'
+import { computeStandings, formatGap } from './standings'
 import type { LapRow, Rider, Room } from './types'
 
 export interface ExportInput {
@@ -108,6 +109,7 @@ const lapText = (ms: number | null) => (ms == null ? '' : formatLap(ms))
 
 /** CSV 本文（BOM なし。改行は CRLF）。表1 概要 / 表2 ライダー別 / 表3 ラップ表 */
 export function buildCsv(input: ExportInput): string {
+  if (input.room.mode === 'solo') return buildSoloCsv(input)
   const { room, laps } = input
   const s = summarize(input)
   const lines: string[] = []
@@ -115,6 +117,7 @@ export function buildCsv(input: ExportInput): string {
   // 表1：概要
   lines.push(csvLine(['項目', '値']))
   lines.push(csvLine(['チーム名', room.team_name]))
+  lines.push(csvLine(['モード', '団体戦']))
   lines.push(csvLine(['状態', s.running ? 'レース中（途中経過）' : room.status === 'finished' ? '終了' : 'スタート前']))
   lines.push(csvLine(['開始時刻', s.startMs != null ? localDateTime(s.startMs) : '']))
   lines.push(csvLine(['終了時刻', s.endMs != null ? localDateTime(s.endMs) : '']))
@@ -163,6 +166,70 @@ export function buildCsv(input: ExportInput): string {
   return lines.join('\r\n') + '\r\n'
 }
 
+/** 個人戦の CSV：表1 概要 / 表2 順位表 / 表3 ラップ表（全員分。本人の周番号付き） */
+function buildSoloCsv(input: ExportInput): string {
+  const { room, laps } = input
+  const s = summarize(input)
+  const rows = computeStandings(laps, { riders: input.riders, ownerRiderId: room.owner_rider_id })
+  const top = rows[0]
+  const lines: string[] = []
+
+  // 表1：概要
+  lines.push(csvLine(['項目', '値']))
+  lines.push(csvLine(['ルーム名', room.team_name]))
+  lines.push(csvLine(['モード', '個人戦']))
+  lines.push(csvLine(['状態', s.running ? 'レース中（途中経過）' : room.status === 'finished' ? '終了' : 'スタート前']))
+  lines.push(csvLine(['開始時刻', s.startMs != null ? localDateTime(s.startMs) : '']))
+  lines.push(csvLine(['終了時刻', s.endMs != null ? localDateTime(s.endMs) : '']))
+  lines.push(csvLine(['レース時間', s.elapsedMs != null ? formatDuration(s.elapsedMs) : '']))
+  lines.push(csvLine(['参加人数', rows.length]))
+  lines.push(csvLine(['トップ', top?.name ?? '']))
+  lines.push(csvLine(['トップの周回', top?.laps ?? '']))
+  lines.push(csvLine(['出力日時', localDateTime(input.now)]))
+  lines.push('')
+
+  // 表2：順位表
+  lines.push(csvLine(['順位', 'ライダー', '周回', 'トップとの差', 'ベスト', 'ベスト(秒)', '平均', '平均(秒)', '最終通過時刻']))
+  for (const r of rows) {
+    lines.push(
+      csvLine([
+        r.position,
+        r.isOwner ? `${r.name} (オーナー)` : r.name,
+        r.laps,
+        formatGap(r.gap),
+        lapText(r.bestMs),
+        sec(r.bestMs),
+        lapText(r.avgMs),
+        sec(r.avgMs),
+        r.reachedAtMs != null ? localDateTime(r.reachedAtMs) : '',
+      ]),
+    )
+  }
+  lines.push('')
+
+  // 表3：ラップ表（通過の順）
+  const bestOf = new Map(rows.map((r) => [r.riderId ?? `name:${r.name}`, r.bestMs]))
+  lines.push(csvLine(['通し番号', 'ライダー', '本人の周', '通過時刻', 'ラップタイム', 'ラップタイム(秒)', '本人のベスト', '手動', '修正']))
+  for (const l of [...laps].sort((a, b) => a.lap_no - b.lap_no)) {
+    const ms = validMs(l)
+    const best = bestOf.get(l.driver_id ?? `name:${l.driver_name}`)
+    lines.push(
+      csvLine([
+        l.lap_no,
+        l.driver_name,
+        l.rider_lap_no,
+        localDateTime(l.crossed_at),
+        lapText(ms),
+        sec(ms),
+        ms != null && ms === best ? '★' : '',
+        l.source === 'manual' ? '○' : '',
+        l.is_override ? '○' : '',
+      ]),
+    )
+  }
+  return lines.join('\r\n') + '\r\n'
+}
+
 /** gpx-track_<チーム名>_<開始日 YYYYMMDD>.csv（ファイル名に使えない文字は _ にする） */
 export function csvFileName(room: Room, now: number): string {
   const team = room.team_name.replace(/[\\/:*?"<>|\s]+/g, '_').replace(/^_+|_+$/g, '') || 'team'
@@ -182,6 +249,7 @@ export function buildShareText(input: ExportInput): string {
   const { room } = input
   const s = summarize(input)
   const lines: string[] = []
+  const solo = room.mode === 'solo'
 
   lines.push(
     s.running
@@ -196,6 +264,17 @@ export function buildShareText(input: ExportInput): string {
     } else {
       lines.push(`${ymd(s.startMs)} ${hm(s.startMs)}〜`)
     }
+  }
+  if (solo) {
+    // 個人戦：順位の一覧
+    const rows = computeStandings(input.laps, { riders: input.riders, ownerRiderId: room.owner_rider_id })
+    if (rows.length > 0) lines.push('―')
+    for (const r of rows) {
+      const best = r.bestMs != null ? `（ベスト ${formatLap(r.bestMs)}）` : ''
+      lines.push(`${r.position}位 ${r.name} ${r.laps}周${best}`)
+    }
+    lines.push('#gpx-track')
+    return lines.join('\n')
   }
   lines.push(`総周回 ${s.total}周`)
   if (s.best) lines.push(`ベスト ${formatLap(s.best.lap_ms)}（${s.best.driver_name}）`)
