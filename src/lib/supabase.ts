@@ -25,6 +25,8 @@ export function errorText(e: unknown): string {
     invalid_time: '時刻が正しくありません',
     duplicate_time: '同じ時刻の通過がすでにあります',
     not_found: '対象が見つかりません',
+    duplicate_name: 'その名前はすでに名簿にあります',
+    not_rider: '名簿にないライダーです',
   }
   for (const k of Object.keys(map)) if (msg.includes(k)) return map[k]
   if (/fetch|network/i.test(msg)) return '通信できませんでした'

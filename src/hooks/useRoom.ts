@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RealtimeChannel } from '@supabase/supabase-js'
 import { CHAT_LIMIT, LAP_PROVISIONAL_SEC, TRAIL_SEC } from '../config'
 import { supabase } from '../lib/supabase'
-import type { ChatMessage, LapRow, Member, PosPayload, Room } from '../lib/types'
+import type { ChatMessage, LapRow, Member, PosPayload, Rider, Room } from '../lib/types'
 
 export interface PosState extends PosPayload {
   receivedAt: number
@@ -13,6 +13,7 @@ export interface PosState extends PosPayload {
 export function useRoom(roomId: string, userId: string, userName: string) {
   const [room, setRoom] = useState<Room | null>(null)
   const [members, setMembers] = useState<Member[]>([])
+  const [riders, setRiders] = useState<Rider[]>([])
   const [laps, setLaps] = useState<LapRow[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [positions, setPositions] = useState<Record<string, PosState>>({})
@@ -28,17 +29,34 @@ export function useRoom(roomId: string, userId: string, userName: string) {
     else setRoom(data as Room)
   }, [roomId])
 
+  /** 端末（メンバー）と名簿（ライダー）をまとめて取り直す */
   const loadMembers = useCallback(async () => {
-    const { data } = await supabase
-      .from('room_members')
-      .select('user_id, color_idx, profiles(name)')
-      .eq('room_id', roomId)
-      .order('joined_at')
-    if (!data) return
+    const [mRes, rRes] = await Promise.all([
+      supabase
+        .from('room_members')
+        .select('user_id, color_idx, current_rider_id, profiles(name)')
+        .eq('room_id', roomId)
+        .order('joined_at'),
+      supabase.from('riders').select('id, name, user_id').eq('room_id', roomId).order('created_at'),
+    ])
+    const rs = (rRes.data as Rider[] | null) ?? null
+    if (rs) setRiders(rs)
+    if (!mRes.data) return
+    const riderName = new Map((rs ?? []).map((r) => [r.id, r.name]))
     setMembers(
-      (data as unknown as { user_id: string; color_idx: number; profiles: { name: string } | null }[]).map(
-        (m) => ({ user_id: m.user_id, color_idx: m.color_idx, name: m.profiles?.name ?? '?' }),
-      ),
+      (
+        mRes.data as unknown as {
+          user_id: string
+          color_idx: number
+          current_rider_id: string | null
+          profiles: { name: string } | null
+        }[]
+      ).map((m) => ({
+        user_id: m.user_id,
+        color_idx: m.color_idx,
+        rider_id: m.current_rider_id,
+        name: (m.current_rider_id && riderName.get(m.current_rider_id)) || m.profiles?.name || '?',
+      })),
     )
   }, [roomId])
 
@@ -150,6 +168,7 @@ export function useRoom(roomId: string, userId: string, userName: string) {
   return {
     room,
     members,
+    riders,
     laps,
     messages,
     positions,

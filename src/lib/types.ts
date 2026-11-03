@@ -35,12 +35,27 @@ export interface Room {
   started_at: string | null
   finished_at: string | null
   last_crosser_id: string | null
+  /** オーナーのライダー。今のライダーがこれになっている端末がオーナーモード */
+  owner_rider_id: string | null
+  last_crosser_rider_id: string | null
   created_at: string
 }
 
+/** 名簿のライダー（端末とは別。ルームごと） */
+export interface Rider {
+  id: string
+  name: string
+  /** 参加時に自動で作った本人のライダーなら、その端末のユーザー */
+  user_id: string | null
+}
+
+/** 端末（匿名ユーザー） */
 export interface Member {
   user_id: string
   color_idx: number
+  /** その端末の今のライダー */
+  rider_id: string | null
+  /** 今のライダーの名前（なければプロフィールの名前） */
   name: string
 }
 
@@ -60,6 +75,7 @@ export interface LapRow {
   crossing_id: string
   crossed_at: string
   lap_ms: number | null
+  /** ラップのライダー（riders.id） */
   driver_id: string | null
   driver_name: string
   driver_meters: number | null
@@ -71,6 +87,8 @@ export interface LapRow {
 /** メンバー間で共有する位置（broadcast pos） */
 export interface PosPayload {
   uid: string
+  /** その端末の今のライダー */
+  rid: string | null
   lat: number
   lng: number
   acc: number
@@ -92,4 +110,9 @@ export function roomLine(room: Room | null): ControlLine | null {
     a: { lat: room.line_a_lat, lng: room.line_a_lng },
     b: { lat: room.line_b_lat, lng: room.line_b_lng },
   }
+}
+
+/** 名簿の表示名。オーナーのライダーには「(オーナー)」を付ける */
+export function riderLabel(rider: Rider, room: Room | null): string {
+  return room?.owner_rider_id === rider.id ? `${rider.name} (オーナー)` : rider.name
 }

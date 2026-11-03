@@ -9,9 +9,10 @@ import { useNotify } from './Notify'
 interface Props {
   room: Room
   isOwner: boolean
-  userName: string
+  /** この端末の今のライダーの名前 */
+  myRiderName: string
   onClose: () => void
-  onRename: (name: string) => Promise<void>
+  onRiderPick: () => void
   onEditLine: () => void
   onLeave: () => void
   onChanged: () => void
@@ -19,9 +20,9 @@ interface Props {
 
 type Confirm = 'start' | 'finish' | 'leave' | null
 
-export function SettingsMenu({ room, isOwner, userName, onClose, onRename, onEditLine, onLeave, onChanged }: Props) {
+export function SettingsMenu({ room, isOwner, myRiderName, onClose, onRiderPick, onEditLine, onLeave, onChanged }: Props) {
   const notify = useNotify()
-  const [name, setName] = useState(userName)
+  const [name, setName] = useState(myRiderName)
   const [startTime, setStartTime] = useState(room.started_at ? toDatetimeLocal(room.started_at) : '')
   const [manualTime, setManualTime] = useState(toDatetimeLocal(Date.now()))
   const [minLap, setMinLap] = useState(String(room.min_lap_sec))
@@ -80,20 +81,26 @@ export function SettingsMenu({ room, isOwner, userName, onClose, onRename, onEdi
   return (
     <Modal title="設定" onClose={onClose}>
       <section className="menu-sec">
-        <h3>名前の変更</h3>
+        <h3>この端末のライダー</h3>
+        <div className="row">
+          <span className="rider-show">
+            {myRiderName}
+            {isOwner && ' (オーナー)'}
+          </span>
+          <button className="btn" onClick={onRiderPick}>
+            切り替え
+          </button>
+        </div>
+      </section>
+
+      <section className="menu-sec">
+        <h3>名前の変更（この端末のライダー）</h3>
         <div className="row">
           <input value={name} maxLength={20} onChange={(e) => setName(e.target.value)} />
           <button
             className="btn"
-            disabled={!name.trim() || name.trim() === userName}
-            onClick={async () => {
-              try {
-                await onRename(name.trim())
-                notify('名前を変更しました')
-              } catch (e) {
-                notify(errorText(e), 'error')
-              }
-            }}
+            disabled={!name.trim() || name.trim() === myRiderName}
+            onClick={() => void rpc('rename_rider', { p_room: room.id, p_name: name.trim() }, '名前を変更しました')}
           >
             変更
           </button>

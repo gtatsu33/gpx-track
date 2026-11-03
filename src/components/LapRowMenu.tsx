@@ -2,19 +2,20 @@ import { useState } from 'react'
 import { formatClock, formatLap } from '../lib/format'
 import type { LapViewRow } from '../lib/laps'
 import { errorText, supabase } from '../lib/supabase'
-import type { Member } from '../lib/types'
+import { riderLabel, type Rider, type Room } from '../lib/types'
 import { ConfirmModal, Modal } from './Modal'
 import { useNotify } from './Notify'
 
 interface Props {
   lap: LapViewRow
-  members: Member[]
+  room: Room
+  riders: Rider[]
   onClose: () => void
   onDone: () => void
 }
 
-/** オーナー用：周の削除・名前の修正 */
-export function LapRowMenu({ lap, members, onClose, onDone }: Props) {
+/** オーナー用：周の削除・名前の修正（名簿から選ぶ） */
+export function LapRowMenu({ lap, room, riders, onClose, onDone }: Props) {
   const [confirmDelete, setConfirmDelete] = useState(false)
   const notify = useNotify()
 
@@ -44,18 +45,18 @@ export function LapRowMenu({ lap, members, onClose, onDone }: Props) {
     <Modal title={`第${lap.lap_no}周  ${formatLap(lap.lap_ms)}`} onClose={onClose}>
       <h3>名前の修正</h3>
       <div className="member-pick">
-        {members.map((m) => (
+        {riders.map((r) => (
           <button
-            key={m.user_id}
-            className={`btn ${lap.driver_id === m.user_id ? 'primary' : ''}`}
+            key={r.id}
+            className={`btn ${lap.driver_id === r.id ? 'primary' : ''}`}
             onClick={() =>
               void run(
-                () => supabase.rpc('set_crossing_driver', { p_id: lap.crossing_id, p_user: m.user_id }),
+                () => supabase.rpc('set_crossing_driver', { p_id: lap.crossing_id, p_rider: r.id }),
                 '名前を修正しました',
               )
             }
           >
-            {m.name}
+            {riderLabel(r, room)}
           </button>
         ))}
       </div>
@@ -64,7 +65,7 @@ export function LapRowMenu({ lap, members, onClose, onDone }: Props) {
           className="btn block"
           onClick={() =>
             void run(
-              () => supabase.rpc('set_crossing_driver', { p_id: lap.crossing_id, p_user: null }),
+              () => supabase.rpc('set_crossing_driver', { p_id: lap.crossing_id, p_rider: null }),
               '自動判定に戻しました',
             )
           }

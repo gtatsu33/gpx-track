@@ -1,5 +1,5 @@
 -- =====================================================================
--- gpx-track  Supabase スキーマ（APP_VERSION 1.0.2）
+-- gpx-track  Supabase スキーマ（APP_VERSION 1.1.0）
 -- SQL Editor でこのファイルを丸ごと実行する。何度実行しても壊れないように書いている。
 -- 実行後に set_owner_passcode.sql でオーナーパスコードを設定すること。
 -- =====================================================================
@@ -85,6 +85,25 @@ create table if not exists public.messages (
 );
 create index if not exists messages_room_idx on public.messages (room_id, id desc);
 
+-- ライダーの名簿（v1.1.0）。端末（匿名ユーザー）とは別に、ルームごとに持つ
+create table if not exists public.riders (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid not null references public.rooms (id) on delete cascade,
+  name text not null check (char_length(name) between 1 and 20),
+  -- 参加したときに自動で作った「本人のライダー」なら、その端末のユーザー。名簿から追加した人は null
+  user_id uuid references auth.users (id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique (room_id, name)
+);
+create index if not exists riders_user_idx on public.riders (user_id);
+
+alter table public.rooms add column if not exists owner_rider_id uuid references public.riders (id) on delete set null;
+alter table public.rooms add column if not exists last_crosser_rider_id uuid references public.riders (id) on delete set null;
+alter table public.room_members add column if not exists current_rider_id uuid references public.riders (id) on delete set null;
+alter table public.crossings add column if not exists rider_id uuid references public.riders (id) on delete set null;
+alter table public.crossings add column if not exists driver_override_rider_id uuid references public.riders (id) on delete set null;
+alter table public.distance_segments add column if not exists rider_id uuid references public.riders (id) on delete cascade;
+
 -- ---------------------------------------------------------------------
 -- 共通の関数
 -- ---------------------------------------------------------------------
@@ -110,7 +129,8 @@ as $$
   );
 $$;
 
--- 内部用：オーナーでなければ例外
+-- 内部用：オーナーモードでなければ例外
+-- オーナーモード＝その端末の今のライダーが、ルームのオーナーのライダーであること
 create or replace function public._require_owner(p_room uuid)
 returns public.rooms
 language plpgsql security definer set search_path = ''
@@ -119,9 +139,69 @@ declare r public.rooms;
 begin
   select * into r from public.rooms where id = p_room;
   if not found then raise exception 'room_not_found'; end if;
-  if r.owner_id is distinct from auth.uid() then raise exception 'not_owner'; end if;
+  if r.owner_rider_id is null or not exists (
+    select 1 from public.room_members m
+    where m.room_id = p_room and m.user_id = auth.uid() and m.current_rider_id = r.owner_rider_id
+  ) then
+    raise exception 'not_owner';
+  end if;
   return r;
 end $$;
+
+-- 内部用：ルーム内で重複しないライダー名を作る（同じ名前があれば末尾に 2, 3, ... を付ける）
+create or replace function public._unique_rider_name(p_room uuid, p_base text)
+returns text
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  base text := coalesce(nullif(btrim(p_base), ''), '?');
+  n text := left(base, 20);
+  i int := 2;
+begin
+  while exists (select 1 from public.riders where room_id = p_room and name = n) loop
+    n := left(base, 20 - length(i::text)) || i::text;
+    i := i + 1;
+  end loop;
+  return n;
+end $$;
+
+-- 内部用：参加した端末に「本人のライダー」を割り当てて、今のライダーにする
+-- 優先順：その端末の本人のライダー → プロフィールと同じ名前のライダー → 新しく作る
+-- オーナーのライダーはパスコードが必要なので、ここでは選ばない
+create or replace function public._assign_own_rider(p_room uuid, p_user uuid)
+returns uuid
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  o uuid;
+  rid uuid;
+  pname text;
+begin
+  select owner_rider_id into o from public.rooms where id = p_room;
+  select name into pname from public.profiles where id = p_user;
+  select id into rid from public.riders
+   where room_id = p_room and user_id = p_user and id is distinct from o
+   order by created_at limit 1;
+  if rid is null then
+    select id into rid from public.riders
+     where room_id = p_room and name = btrim(pname) and id is distinct from o;
+  end if;
+  if rid is null then
+    insert into public.riders (room_id, name, user_id)
+    values (p_room, public._unique_rider_name(p_room, pname), p_user)
+    returning id into rid;
+  end if;
+  update public.room_members set current_rider_id = rid where room_id = p_room and user_id = p_user;
+  return rid;
+end $$;
+
+-- 内部用：その端末の今のライダー
+create or replace function public._current_rider(p_room uuid, p_user uuid)
+returns uuid
+language sql stable security definer set search_path = ''
+as $$
+  select current_rider_id from public.room_members where room_id = p_room and user_id = p_user;
+$$;
 
 -- 内部用：Realtime（private チャネル room:<id>）へ配信。失敗しても本処理は止めない
 create or replace function public._room_broadcast(p_room uuid, p_event text, p_payload jsonb)
@@ -186,6 +266,11 @@ alter table public.room_members enable row level security;
 alter table public.crossings enable row level security;
 alter table public.distance_segments enable row level security;
 alter table public.messages enable row level security;
+alter table public.riders enable row level security;
+
+drop policy if exists riders_select on public.riders;
+create policy riders_select on public.riders for select to authenticated
+  using (public.is_room_member(room_id));
 
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles for select to authenticated
@@ -234,15 +319,19 @@ create policy messages_insert on public.messages for insert to authenticated
     and public.is_room_member(room_id)
   );
 
--- ユーザーのメッセージの名前はサーバー側でプロフィールから入れる（なりすまし防止）
+-- ユーザーのメッセージの名前はサーバー側で入れる（なりすまし防止）
+-- その端末の今のライダーの名前。なければプロフィールの名前
 create or replace function public._messages_fill_name()
 returns trigger
 language plpgsql security definer set search_path = ''
 as $$
 begin
   if new.kind = 'user' then
-    select name into new.name from public.profiles where id = new.user_id;
-    new.name := coalesce(new.name, '');
+    new.name := coalesce(
+      (select rd.name from public.room_members m join public.riders rd on rd.id = m.current_rider_id
+        where m.room_id = new.room_id and m.user_id = new.user_id),
+      (select name from public.profiles where id = new.user_id),
+      '');
     new.created_at := now();
   end if;
   return new;
@@ -250,6 +339,22 @@ end $$;
 drop trigger if exists messages_fill_name on public.messages;
 create trigger messages_fill_name before insert on public.messages
   for each row execute function public._messages_fill_name();
+
+-- 走行距離のライダー：送られてきた rider_id がルームのライダーでなければ、その端末の今のライダーにする
+create or replace function public._segments_fill_rider()
+returns trigger
+language plpgsql security definer set search_path = ''
+as $$
+begin
+  if new.rider_id is null
+     or not exists (select 1 from public.riders where id = new.rider_id and room_id = new.room_id) then
+    new.rider_id := public._current_rider(new.room_id, new.user_id);
+  end if;
+  return new;
+end $$;
+drop trigger if exists segments_fill_rider on public.distance_segments;
+create trigger segments_fill_rider before insert on public.distance_segments
+  for each row execute function public._segments_fill_rider();
 
 -- ---------------------------------------------------------------------
 -- DB の変更を Realtime に配信するトリガー
@@ -309,6 +414,17 @@ drop trigger if exists bc_profiles on public.profiles;
 create trigger bc_profiles after update on public.profiles
   for each row execute function public._bc_profiles();
 
+-- 名簿の追加・名前の変更も member イベントとして配信する
+create or replace function public._bc_riders()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  perform public._room_broadcast(new.room_id, 'member', jsonb_build_object('room_id', new.room_id));
+  return null;
+end $$;
+drop trigger if exists bc_riders on public.riders;
+create trigger bc_riders after insert or update on public.riders
+  for each row execute function public._bc_riders();
+
 -- ---------------------------------------------------------------------
 -- RPC
 -- ---------------------------------------------------------------------
@@ -333,15 +449,21 @@ as $$
 declare
   uid uuid := auth.uid();
   r public.rooms;
+  rid uuid;
+  pname text;
 begin
   if uid is null then raise exception 'not_authenticated'; end if;
   perform public._check_passcode(p_passcode);
-  if not exists (select 1 from public.profiles where id = uid) then raise exception 'no_profile'; end if;
+  select name into pname from public.profiles where id = uid;
+  if pname is null then raise exception 'no_profile'; end if;
   insert into public.rooms (code, team_name, owner_id, duration_min, min_lap_sec, moving_kmh)
   values (public._gen_room_code(), btrim(p_team_name), uid, p_duration_min,
           coalesce(p_min_lap_sec, 30), coalesce(p_moving_kmh, 15))
   returning * into r;
-  insert into public.room_members (room_id, user_id, color_idx) values (r.id, uid, 0);
+  -- 作った人の本人のライダーを、オーナーのライダーにする
+  insert into public.riders (room_id, name, user_id) values (r.id, pname, uid) returning id into rid;
+  update public.rooms set owner_rider_id = rid where id = r.id;
+  insert into public.room_members (room_id, user_id, color_idx, current_rider_id) values (r.id, uid, 0, rid);
   return jsonb_build_object('id', r.id, 'code', r.code);
 end $$;
 
@@ -360,9 +482,13 @@ begin
   insert into public.room_members (room_id, user_id, color_idx)
   values (rid, uid, (select coalesce(max(color_idx) + 1, 0) from public.room_members where room_id = rid))
   on conflict (room_id, user_id) do nothing;
+  if public._current_rider(rid, uid) is null then
+    perform public._assign_own_rider(rid, uid);
+  end if;
   return rid;
 end $$;
 
+-- オーナー権限の復帰：参加して、オーナーのライダーに切り替える
 create or replace function public.reclaim_owner(p_code text, p_passcode text)
 returns uuid
 language plpgsql security definer set search_path = ''
@@ -370,12 +496,77 @@ as $$
 declare
   uid uuid := auth.uid();
   rid uuid;
+  o uuid;
 begin
   if uid is null then raise exception 'not_authenticated'; end if;
   perform public._check_passcode(p_passcode);
   rid := public.join_room(p_code);
-  update public.rooms set owner_id = uid where id = rid;
+  select owner_rider_id into o from public.rooms where id = rid;
+  if o is null then
+    -- オーナーのライダーがない古いルームは、この端末の今のライダーをオーナーにする
+    update public.rooms set owner_rider_id = public._current_rider(rid, uid) where id = rid;
+  else
+    update public.room_members set current_rider_id = o
+     where room_id = rid and user_id = uid and current_rider_id is distinct from o;
+  end if;
   return rid;
+end $$;
+
+-- この端末のライダーを切り替える。オーナーのライダーにはパスコードが必要
+create or replace function public.switch_rider(p_room uuid, p_rider uuid, p_passcode text default null)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare r public.rooms;
+begin
+  if auth.uid() is null or not public.is_room_member(p_room) then raise exception 'not_member'; end if;
+  select * into r from public.rooms where id = p_room;
+  if not exists (select 1 from public.riders where id = p_rider and room_id = p_room) then
+    raise exception 'not_rider';
+  end if;
+  if p_rider = r.owner_rider_id then
+    perform public._check_passcode(p_passcode);
+  end if;
+  update public.room_members set current_rider_id = p_rider
+   where room_id = p_room and user_id = auth.uid() and current_rider_id is distinct from p_rider;
+end $$;
+
+-- 名簿にライダーを追加し、この端末の今のライダーにする
+create or replace function public.add_rider(p_room uuid, p_name text)
+returns uuid
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  n text := btrim(p_name);
+  rid uuid;
+begin
+  if auth.uid() is null or not public.is_room_member(p_room) then raise exception 'not_member'; end if;
+  if n is null or char_length(n) not between 1 and 20 then raise exception 'invalid_name'; end if;
+  if exists (select 1 from public.riders where room_id = p_room and name = n) then
+    raise exception 'duplicate_name';
+  end if;
+  insert into public.riders (room_id, name, user_id) values (p_room, n, null) returning id into rid;
+  update public.room_members set current_rider_id = rid where room_id = p_room and user_id = auth.uid();
+  return rid;
+end $$;
+
+-- この端末の今のライダーの名前を変える
+create or replace function public.rename_rider(p_room uuid, p_name text)
+returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare
+  n text := btrim(p_name);
+  rid uuid;
+begin
+  if auth.uid() is null or not public.is_room_member(p_room) then raise exception 'not_member'; end if;
+  if n is null or char_length(n) not between 1 and 20 then raise exception 'invalid_name'; end if;
+  rid := public._current_rider(p_room, auth.uid());
+  if rid is null then raise exception 'not_rider'; end if;
+  if exists (select 1 from public.riders where room_id = p_room and name = n and id <> rid) then
+    raise exception 'duplicate_name';
+  end if;
+  update public.riders set name = n where id = rid and name <> n;
 end $$;
 
 create or replace function public.set_line(p_room uuid, p_a_lat double precision, p_a_lng double precision,
@@ -446,24 +637,35 @@ language sql security definer set search_path = ''
 as $$
   -- 値が変わるときだけ更新する（rooms の更新は全員に配信されるため）
   with latest as (
-    select (select crosser_id from public.crossings
-            where room_id = p_room and not deleted
-            order by crossed_at desc limit 1) as cid
+    select x.crosser_id as cid, x.rider_id as rid
+    from (select 1) one
+    left join lateral (
+      select crosser_id, rider_id from public.crossings
+       where room_id = p_room and not deleted
+       order by crossed_at desc limit 1
+    ) x on true
   )
-  update public.rooms r set last_crosser_id = latest.cid
+  update public.rooms r set last_crosser_id = latest.cid, last_crosser_rider_id = latest.rid
     from latest
-   where r.id = p_room and r.last_crosser_id is distinct from latest.cid;
+   where r.id = p_room
+     and (r.last_crosser_id is distinct from latest.cid or r.last_crosser_rider_id is distinct from latest.rid);
 $$;
 
-create or replace function public.record_crossing(p_room uuid, p_crossed_at timestamptz)
+-- v1.0.x の引数（p_room, p_crossed_at）の版を削除（引数の数が違う関数が並ぶと呼び出しがあいまいになるため）
+drop function if exists public.record_crossing(uuid, timestamptz);
+
+-- p_rider：通過した瞬間のその端末のライダー（再送で遅れて届くことがあるため端末から送る）。
+--          null かルームのライダーでなければ、その端末の今のライダーにする
+create or replace function public.record_crossing(p_room uuid, p_crossed_at timestamptz, p_rider uuid default null)
 returns text
 language plpgsql security definer set search_path = ''
 as $$
 declare
   uid uuid := auth.uid();
   r public.rooms;
+  rider uuid;
   uname text;
-  prev_crosser uuid;
+  prev_rider uuid;
 begin
   if uid is null or not public.is_room_member(p_room) then raise exception 'not_member'; end if;
 
@@ -489,21 +691,27 @@ begin
     return 'too_soon';
   end if;
 
-  select name into uname from public.profiles where id = uid;
-  select crosser_id into prev_crosser from public.crossings
+  if p_rider is not null and exists (select 1 from public.riders where id = p_rider and room_id = p_room) then
+    rider := p_rider;
+  else
+    rider := public._current_rider(p_room, uid);
+  end if;
+  select coalesce((select name from public.riders where id = rider),
+                  (select name from public.profiles where id = uid)) into uname;
+  select rider_id into prev_rider from public.crossings
    where room_id = p_room and not deleted and crossed_at < p_crossed_at
    order by crossed_at desc limit 1;
 
   begin
-    insert into public.crossings (room_id, crosser_id, crosser_name, crossed_at, source)
-    values (p_room, uid, coalesce(uname, '?'), p_crossed_at, 'gps');
+    insert into public.crossings (room_id, crosser_id, crosser_name, crossed_at, source, rider_id)
+    values (p_room, uid, coalesce(uname, '?'), p_crossed_at, 'gps', rider);
   exception when unique_violation then
     return 'too_soon';
   end;
 
   perform public._refresh_last_crosser(p_room);
 
-  if prev_crosser is not null and prev_crosser <> uid then
+  if prev_rider is not null and rider is not null and prev_rider <> rider then
     perform public._post_system_message(p_room, 'ライダー交代：' || coalesce(uname, '?'));
   end if;
 
@@ -517,6 +725,7 @@ as $$
 declare
   r public.rooms;
   cid uuid;
+  crid uuid;
   cname text;
 begin
   r := public._require_owner(p_room);
@@ -524,15 +733,17 @@ begin
   if p_crossed_at <= r.started_at or p_crossed_at > now() + interval '5 seconds' then
     raise exception 'invalid_time';
   end if;
-  -- その時刻の直前に通過した人（いなければ現在の last_crosser、さらにいなければオーナー）
-  select crosser_id into cid from public.crossings
+  -- その時刻の直前に通過したライダー（いなければ最後に通過したライダー、さらにいなければオーナーのライダー）
+  select crosser_id, rider_id into cid, crid from public.crossings
    where room_id = p_room and not deleted and crossed_at < p_crossed_at
    order by crossed_at desc limit 1;
   cid := coalesce(cid, r.last_crosser_id, auth.uid());
-  select name into cname from public.profiles where id = cid;
+  crid := coalesce(crid, r.last_crosser_rider_id, r.owner_rider_id);
+  select coalesce((select name from public.riders where id = crid),
+                  (select name from public.profiles where id = cid)) into cname;
   begin
-    insert into public.crossings (room_id, crosser_id, crosser_name, crossed_at, source)
-    values (p_room, cid, coalesce(cname, '?'), p_crossed_at, 'manual');
+    insert into public.crossings (room_id, crosser_id, crosser_name, crossed_at, source, rider_id)
+    values (p_room, cid, coalesce(cname, '?'), p_crossed_at, 'manual', crid);
   exception when unique_violation then
     raise exception 'duplicate_time';
   end;
@@ -552,7 +763,9 @@ begin
   perform public._refresh_last_crosser(rid);
 end $$;
 
-create or replace function public.set_crossing_driver(p_id uuid, p_user uuid)
+-- 引数名を p_user から p_rider に変えたので、作り直す
+drop function if exists public.set_crossing_driver(uuid, uuid);
+create function public.set_crossing_driver(p_id uuid, p_rider uuid)
 returns void
 language plpgsql security definer set search_path = ''
 as $$
@@ -561,12 +774,12 @@ begin
   select room_id into rid from public.crossings where id = p_id;
   if rid is null then raise exception 'not_found'; end if;
   perform public._require_owner(rid);
-  if p_user is not null and not exists (
-    select 1 from public.room_members where room_id = rid and user_id = p_user
+  if p_rider is not null and not exists (
+    select 1 from public.riders where room_id = rid and id = p_rider
   ) then
-    raise exception 'not_member';
+    raise exception 'not_rider';
   end if;
-  update public.crossings set driver_override_id = p_user where id = p_id;
+  update public.crossings set driver_override_rider_id = p_rider, driver_override_id = null where id = p_id;
 end $$;
 
 -- ラップ表（周番号・ラップタイム・ライダーをサーバー側で計算）
@@ -589,8 +802,9 @@ as $$
 begin
   if not public.is_room_member(p_room) then raise exception 'not_member'; end if;
   return query
+  -- driver_id はライダー（riders.id）。走行距離もライダーごとに集計する
   with c as (
-    select x.id, x.crossed_at, x.crosser_id, x.crosser_name, x.source, x.driver_override_id,
+    select x.id, x.crossed_at, x.crosser_id, x.crosser_name, x.source, x.rider_id, x.driver_override_rider_id,
            row_number() over (order by x.crossed_at)::int as n,
            coalesce(lag(x.crossed_at) over (order by x.crossed_at),
                     (select r.started_at from public.rooms r where r.id = p_room)) as lap_start
@@ -598,37 +812,86 @@ begin
     where x.room_id = p_room and not x.deleted
   ),
   d as (
-    select c.id as cid, s.user_id,
+    select c.id as cid, s.rider_id,
            sum(
              s.meters * greatest(0, extract(epoch from (least(s.t_to, c.crossed_at) - greatest(s.t_from, c.lap_start))))
              / greatest(extract(epoch from (s.t_to - s.t_from)), 0.001)
            )::double precision as m
     from c
     join public.distance_segments s
-      on s.room_id = p_room and s.t_to > c.lap_start and s.t_from < c.crossed_at
-    group by c.id, s.user_id
+      on s.room_id = p_room and s.rider_id is not null and s.t_to > c.lap_start and s.t_from < c.crossed_at
+    group by c.id, s.rider_id
   ),
   best as (
-    select distinct on (d.cid) d.cid, d.user_id, d.m
+    select distinct on (d.cid) d.cid, d.rider_id, d.m
     from d join c on c.id = d.cid
     where d.m > 0
-    order by d.cid, d.m desc, (d.user_id = c.crosser_id) desc
+    order by d.cid, d.m desc, (d.rider_id = c.rider_id) desc
+  ),
+  pick as (
+    select c.*, coalesce(c.driver_override_rider_id, best.rider_id, c.rider_id) as drv
+    from c left join best on best.cid = c.id
   )
-  select c.n,
-         c.id,
-         c.crossed_at,
-         round(extract(epoch from (c.crossed_at - c.lap_start)) * 1000)::bigint,
-         coalesce(c.driver_override_id, best.user_id, c.crosser_id),
-         coalesce(p.name, c.crosser_name),
+  select pick.n,
+         pick.id,
+         pick.crossed_at,
+         round(extract(epoch from (pick.crossed_at - pick.lap_start)) * 1000)::bigint,
+         pick.drv,
+         coalesce(rd.name, pick.crosser_name),
          dm.m,
-         c.source,
-         c.driver_override_id is not null,
-         c.crosser_id
-  from c
-  left join best on best.cid = c.id
-  left join public.profiles p on p.id = coalesce(c.driver_override_id, best.user_id, c.crosser_id)
-  left join d dm on dm.cid = c.id and dm.user_id = coalesce(c.driver_override_id, best.user_id, c.crosser_id)
-  order by c.n;
+         pick.source,
+         pick.driver_override_rider_id is not null,
+         pick.crosser_id
+  from pick
+  left join public.riders rd on rd.id = pick.drv
+  left join d dm on dm.cid = pick.id and dm.rider_id = pick.drv
+  order by pick.n;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- v1.0.x のデータをライダーの名簿に移す（何度実行しても、まだ移していない行だけが対象になる）
+-- ---------------------------------------------------------------------
+do $$
+declare
+  x record;
+  rid uuid;
+begin
+  -- 1. オーナーのライダー：作った人の本人のライダーを作り、オーナーにする
+  for x in
+    select r.id as room_id, r.owner_id from public.rooms r
+    where r.owner_rider_id is null and r.owner_id is not null
+      and exists (select 1 from public.room_members m where m.room_id = r.id and m.user_id = r.owner_id)
+  loop
+    select current_rider_id into rid from public.room_members where room_id = x.room_id and user_id = x.owner_id;
+    if rid is null then
+      insert into public.riders (room_id, name, user_id)
+      values (x.room_id, public._unique_rider_name(x.room_id, (select name from public.profiles where id = x.owner_id)), x.owner_id)
+      returning id into rid;
+      update public.room_members set current_rider_id = rid where room_id = x.room_id and user_id = x.owner_id;
+    end if;
+    update public.rooms set owner_rider_id = rid where id = x.room_id;
+  end loop;
+
+  -- 2. ほかのメンバーの本人のライダー
+  for x in select room_id, user_id from public.room_members where current_rider_id is null loop
+    perform public._assign_own_rider(x.room_id, x.user_id);
+  end loop;
+
+  -- 3. 通過・名前の修正・走行距離に、その端末の本人のライダーを入れる
+  update public.crossings c set rider_id = (
+    select id from public.riders where room_id = c.room_id and user_id = c.crosser_id order by created_at limit 1)
+   where c.rider_id is null and c.crosser_id is not null;
+  update public.crossings c set driver_override_rider_id = (
+    select id from public.riders where room_id = c.room_id and user_id = c.driver_override_id order by created_at limit 1)
+   where c.driver_override_rider_id is null and c.driver_override_id is not null;
+  update public.distance_segments s set rider_id = (
+    select id from public.riders where room_id = s.room_id and user_id = s.user_id order by created_at limit 1)
+   where s.rider_id is null;
+
+  -- 4. 最後に通過したライダー
+  for x in select id from public.rooms where last_crosser_rider_id is null and last_crosser_id is not null loop
+    perform public._refresh_last_crosser(x.id);
+  end loop;
 end $$;
 
 -- ---------------------------------------------------------------------
@@ -644,9 +907,11 @@ begin
       'is_room_member', 'shares_room_with', '_require_owner', '_room_broadcast', '_post_system_message',
       '_gen_room_code', '_check_passcode', '_messages_fill_name', '_bc_rooms', '_bc_crossings',
       '_bc_messages', '_bc_members', '_bc_profiles', '_refresh_last_crosser',
+      '_unique_rider_name', '_assign_own_rider', '_current_rider', '_segments_fill_rider', '_bc_riders',
       'update_profile_name', 'create_room', 'join_room', 'reclaim_owner', 'set_line',
       'update_room_settings', 'start_race', 'set_start_time', 'finish_race', 'record_crossing',
-      'add_manual_crossing', 'delete_crossing', 'set_crossing_driver', 'get_lap_table')
+      'add_manual_crossing', 'delete_crossing', 'set_crossing_driver', 'get_lap_table',
+      'switch_rider', 'add_rider', 'rename_rider')
   loop
     execute format('revoke all on function %s from public, anon', f.sig);
     if f.proname not like '\_%' then

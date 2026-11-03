@@ -64,7 +64,12 @@ h3 { font-size: 15px; margin: 14px 0 8px; }
 .team { font-weight: 800; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .clock { font-variant-numeric: tabular-nums; font-size: 14px; white-space: nowrap; }
 .laps b { font-size: 22px; color: var(--accent); margin-right: 2px; font-variant-numeric: tabular-nums; }
-.rider { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.rider { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.rider-now, .rider-me { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rider-now { font-weight: 600; }
+.rider-me { font-size: 11px; opacity: 0.75; text-decoration: underline dotted; }
+.owner-tag { margin-left: 4px; font-size: 10px; padding: 0 5px; border-radius: 4px; background: #f59e0b; color: #fff; font-weight: 700; }
+.rider-show { flex: 1; font-size: 18px; font-weight: 700; }
 .badge { margin-left: 6px; font-size: 11px; background: var(--ok); color: #fff; border-radius: 999px; padding: 2px 7px; vertical-align: middle; }
 .hdr-icons { display: flex; align-items: center; gap: 2px; }
 .hdr-icons .icon-btn { color: var(--head-ink); }

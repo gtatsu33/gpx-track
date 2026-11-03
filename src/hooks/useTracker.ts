@@ -20,12 +20,14 @@ import { useGeolocation } from './useGeolocation'
 interface Options {
   room: Room | null
   userId: string
+  /** この端末の今のライダー */
+  riderId: string | null
   sendPos: (p: PosPayload) => void
   setOwnPos: (p: PosPayload) => void
   onCrossing?: (result: string) => void
 }
 
-export function useTracker({ room, userId, sendPos, setOwnPos, onCrossing }: Options) {
+export function useTracker({ room, userId, riderId, sendPos, setOwnPos, onCrossing }: Options) {
   const [moving, setMoving] = useState(false)
   const [lastFix, setLastFix] = useState<Fix | null>(null)
 
@@ -41,6 +43,8 @@ export function useTracker({ room, userId, sendPos, setOwnPos, onCrossing }: Opt
   const lastSentAt = useRef(0)
   const roomRef = useRef(room)
   roomRef.current = room
+  const riderRef = useRef(riderId)
+  riderRef.current = riderId
   const cbRef = useRef({ sendPos, setOwnPos, onCrossing })
   cbRef.current = { sendPos, setOwnPos, onCrossing }
 
@@ -65,12 +69,13 @@ export function useTracker({ room, userId, sendPos, setOwnPos, onCrossing }: Opt
       r.min_lap_sec,
     )
     if (t != null && r.status === 'running' && r.started_at && t > Date.parse(r.started_at)) {
-      void sendOrQueue({ kind: 'crossing', room: r.id, t }).then((res) => cbRef.current.onCrossing?.(res))
+      void sendOrQueue({ kind: 'crossing', room: r.id, t, rider: riderRef.current }).then((res) => cbRef.current.onCrossing?.(res))
     }
 
     // 位置の送信（走行中5秒 / ピット10秒ごと）
     const payload: PosPayload = {
       uid: userId,
+      rid: riderRef.current,
       lat: fix.lat,
       lng: fix.lng,
       acc: Math.round(fix.acc),
@@ -97,15 +102,28 @@ export function useTracker({ room, userId, sendPos, setOwnPos, onCrossing }: Opt
   }, [lineKey])
 
   // 走行距離をまとめて送る
+  const flushDistance = (rider: string | null) => {
+    const seg = tracker.current.flush()
+    const r = roomRef.current
+    if (!seg || !r || r.status !== 'running') return
+    void sendOrQueue({ kind: 'segment', room: r.id, user: userId, rider, from: seg.from, to: seg.to, meters: seg.meters })
+  }
+  const flushRef = useRef(flushDistance)
+  flushRef.current = flushDistance
+
   useEffect(() => {
-    const id = window.setInterval(() => {
-      const seg = tracker.current.flush()
-      const r = roomRef.current
-      if (!seg || !r || r.status !== 'running') return
-      void sendOrQueue({ kind: 'segment', room: r.id, user: userId, from: seg.from, to: seg.to, meters: seg.meters })
-    }, DISTANCE_FLUSH_SEC * 1000)
+    const id = window.setInterval(() => flushRef.current(riderRef.current), DISTANCE_FLUSH_SEC * 1000)
     return () => window.clearInterval(id)
-  }, [userId])
+  }, [])
+
+  // ライダーを切り替えたら、それまでの距離を前のライダーの分として先に送る
+  const prevRider = useRef(riderId)
+  useEffect(() => {
+    if (prevRider.current !== riderId) {
+      flushRef.current(prevRider.current)
+      prevRider.current = riderId
+    }
+  }, [riderId])
 
   // 送れなかったデータの再送
   useEffect(() => {

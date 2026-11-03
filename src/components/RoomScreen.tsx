@@ -10,6 +10,7 @@ import { Header } from './Header'
 import { LapTable } from './LapTable'
 import { MapView } from './MapView'
 import { Modal } from './Modal'
+import { RiderPicker } from './RiderPicker'
 import { useNotify } from './Notify'
 import { SettingsMenu } from './SettingsMenu'
 
@@ -17,22 +18,25 @@ interface Props {
   roomId: string
   userId: string
   userName: string
-  onRename: (name: string) => Promise<void>
   onExit: () => void
 }
 
 type Tab = 'map' | 'laps'
 type Info = 'wake' | 'geo' | null
 
-export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props) {
+export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
   const notify = useNotify()
   const data = useRoom(roomId, userId, userName)
-  const { room, members, laps, messages, positions, online } = data
+  const { room, members, riders, laps, messages, positions, online } = data
   const [tab, setTab] = useState<Tab>('map')
   const [now, setNow] = useState(Date.now())
   const [settings, setSettings] = useState(false)
   const [editingLine, setEditingLine] = useState(false)
   const [info, setInfo] = useState<Info>(null)
+  const [picking, setPicking] = useState(false)
+
+  const me = members.find((m) => m.user_id === userId)
+  const myRiderId = me?.rider_id ?? null
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
@@ -48,6 +52,7 @@ export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props
   const { moving, geoStatus } = useTracker({
     room,
     userId,
+    riderId: myRiderId,
     sendPos: data.sendPos,
     setOwnPos: data.setOwnPos,
     onCrossing,
@@ -66,15 +71,21 @@ export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props
   }
   if (!room) return <div className="page center">読み込み中…</div>
 
-  const isOwner = room.owner_id === userId
-  const nameOf = (uid: string | null) => (uid ? members.find((m) => m.user_id === uid)?.name ?? null : null)
+  // オーナーモード：この端末の今のライダーがオーナーのライダー
+  const isOwner = myRiderId != null && myRiderId === room.owner_rider_id
+  const riderNameOf = (rid: string | null | undefined) => (rid ? riders.find((r) => r.id === rid)?.name ?? null : null)
+  const myRiderName = riderNameOf(myRiderId) ?? userName
 
-  // 現在のライダー：走行中のメンバー（複数なら速い方）、いなければ最後に通過した人
+  // 現在のライダー：走行中の端末（複数なら速い方）のライダー、いなければ最後に通過したライダー
+  // riderId は地図で強調する端末（ユーザーID）
   const movingNow = Object.values(positions).filter(
     (p) => p.moving && now - p.receivedAt <= STALE_MARKER_SEC * 1000,
   )
   movingNow.sort((a, b) => (b.spd ?? 0) - (a.spd ?? 0))
   const riderId = movingNow[0]?.uid ?? room.last_crosser_id
+  const riderName = movingNow[0]
+    ? riderNameOf(movingNow[0].rid) ?? members.find((m) => m.user_id === movingNow[0].uid)?.name ?? null
+    : riderNameOf(room.last_crosser_rider_id)
 
   const saveLine = async (line: ControlLine) => {
     const { error } = await supabase.rpc('set_line', {
@@ -104,8 +115,11 @@ export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props
         room={room}
         now={now}
         lapCount={laps.length}
-        riderName={nameOf(riderId)}
+        riderName={riderName}
         riderIsMe={riderId === userId}
+        myRiderName={myRiderName}
+        isOwner={isOwner}
+        onRiderPick={() => setPicking(true)}
         meMoving={moving}
         wake={wake}
         geo={geoStatus}
@@ -140,7 +154,8 @@ export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props
           laps={laps}
           now={now}
           isOwner={isOwner}
-          members={members}
+          room={room}
+          riders={riders}
           onChanged={() => void data.loadLaps()}
         />
       </main>
@@ -151,9 +166,12 @@ export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props
         <SettingsMenu
           room={room}
           isOwner={isOwner}
-          userName={userName}
+          myRiderName={myRiderName}
           onClose={() => setSettings(false)}
-          onRename={onRename}
+          onRiderPick={() => {
+            setSettings(false)
+            setPicking(true)
+          }}
           onEditLine={() => {
             setTab('map')
             setEditingLine(true)
@@ -161,8 +179,19 @@ export function RoomScreen({ roomId, userId, userName, onRename, onExit }: Props
           onLeave={() => void leave()}
           onChanged={() => {
             void data.loadRoom()
+            void data.loadMembers()
             void data.loadLaps()
           }}
+        />
+      )}
+
+      {picking && (
+        <RiderPicker
+          room={room}
+          riders={riders}
+          myRiderId={myRiderId}
+          onClose={() => setPicking(false)}
+          onChanged={() => void data.loadMembers()}
         />
       )}
 

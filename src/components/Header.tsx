@@ -10,6 +10,10 @@ interface Props {
   riderName: string | null
   riderIsMe: boolean
   meMoving: boolean
+  /** この端末の今のライダー */
+  myRiderName: string
+  isOwner: boolean
+  onRiderPick: () => void
   wake: WakeLockStatus
   geo: GeoStatus
   connected: boolean
@@ -39,10 +43,16 @@ export function Header(p: Props) {
         <span className="laps">
           <b>{p.lapCount}</b>周
         </span>
-        <span className="rider">
-          🚴 {p.riderName ?? '—'}
-          {p.meMoving && <span className="badge">{p.riderIsMe ? '走行中' : '自分:走行中'}</span>}
-        </span>
+        <button className="rider" onClick={p.onRiderPick} aria-label="この端末のライダーを切り替え">
+          <span className="rider-now">
+            🚴 {p.riderName ?? '—'}
+            {p.meMoving && <span className="badge">{p.riderIsMe ? '走行中' : '自分:走行中'}</span>}
+          </span>
+          <span className="rider-me">
+            この端末：{p.myRiderName}
+            {p.isOwner && <span className="owner-tag">オーナー</span>}
+          </span>
+        </button>
         <span className="hdr-icons">
           <span className={`conn ${p.connected ? 'on' : 'off'}`} title={p.connected ? '接続中' : '再接続中'} />
           {geoBad && (

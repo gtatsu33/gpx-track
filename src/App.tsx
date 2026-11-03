@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { CreateRoom } from './components/CreateRoom'
 import { Home } from './components/Home'
 import { NameSetup } from './components/NameSetup'
@@ -32,6 +32,15 @@ function AppInner() {
   const initialCode = new URLSearchParams(window.location.search).get('room')?.toUpperCase() ?? ''
   const [roomId, setRoomId] = useState<string | null>(() => (initialCode ? null : readCurrentRoom()))
   const [screen, setScreen] = useState<Screen>(() => (roomId ? 'room' : 'home'))
+
+  // ユーザーが消されていて入り直したときは、前回のルーム（もう無い）を開かずにホームへ
+  useEffect(() => {
+    if (auth.reset) {
+      writeCurrentRoom(null)
+      setRoomId(null)
+      setScreen('home')
+    }
+  }, [auth.reset])
 
   if (!supabaseConfigured) {
     return (
@@ -68,7 +77,6 @@ function AppInner() {
             roomId={roomId}
             userId={auth.userId}
             userName={auth.name}
-            onRename={auth.rename}
             onExit={goHome}
           />
         )

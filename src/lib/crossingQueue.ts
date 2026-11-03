@@ -2,8 +2,8 @@
 import { supabase } from './supabase'
 
 export type QueueJob =
-  | { kind: 'crossing'; room: string; t: number }
-  | { kind: 'segment'; room: string; user: string; from: number; to: number; meters: number }
+  | { kind: 'crossing'; room: string; t: number; rider?: string | null }
+  | { kind: 'segment'; room: string; user: string; rider?: string | null; from: number; to: number; meters: number }
 
 const KEY = 'gpx-track.queue'
 const MAX_JOBS = 1000
@@ -39,6 +39,7 @@ export async function sendJob(job: QueueJob): Promise<SendResult> {
       const { error, status } = await supabase.rpc('record_crossing', {
         p_room: job.room,
         p_crossed_at: new Date(job.t).toISOString(),
+        p_rider: job.rider ?? null,
       })
       if (!error) return 'ok'
       return status === 0 || status >= 500 ? 'retry' : 'drop'
@@ -46,6 +47,7 @@ export async function sendJob(job: QueueJob): Promise<SendResult> {
     const { error, status } = await supabase.from('distance_segments').insert({
       room_id: job.room,
       user_id: job.user,
+      rider_id: job.rider ?? null,
       t_from: new Date(job.from).toISOString(),
       t_to: new Date(job.to).toISOString(),
       meters: job.meters,

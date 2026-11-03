@@ -1,5 +1,5 @@
 耐久レース チーム位置共有アプリ 実装仕様書
-作成日：2026-11-02　対象バージョン：APP_VERSION 1.0.2
+作成日：2026-11-02（2026-11-03 更新）　対象バージョン：APP_VERSION 1.1.1
 
 ■1. 技術スタック（2026-11-02 に npm registry と公式ドキュメントで確認した安定版）
 - vite 8.3.5
@@ -25,6 +25,7 @@ gpx-track/
     schema.sql                 テーブル、RLS、RPC、トリガー、Realtimeのポリシー
     set_owner_passcode.sql     オーナーパスコードの設定と変更
     cleanup.sql                古いデータと匿名ユーザーの削除（手動で実行）
+    cleanup_now.sql            すべてのルームと匿名ユーザーの削除（作り直す前に手動で1回だけ実行。パスコードは残す）
   src/
     main.tsx / App.tsx         画面の切り替え（名前登録 / ホーム / 作成 / ルーム）
     version.ts                 export const APP_VERSION = '1.0.0'
@@ -44,7 +45,8 @@ gpx-track/
     hooks/useTracker.ts        走行状態、位置の送信、通過の記録、距離の記録をまとめて行う
     components/  NameSetup, Home, CreateRoom, ReclaimOwner, RoomScreen, Header,
                  MapView（ライン編集を含む）, LapTable, LapRowMenu, ChatArea（QuickButtons を含む）,
-                 SettingsMenu, Modal（ConfirmModal を含む）, Notify（画面上部の通知）
+                 SettingsMenu, RiderPicker（この端末のライダーの切り替え・追加）,
+                 Modal（ConfirmModal を含む）, Notify（画面上部の通知）
     dev/gpsSimulator.ts        開発用の疑似GPS
   tests/  geo.test.ts, lapDetector.test.ts, movingState.test.ts, laps.test.ts, format.test.ts
 
@@ -67,19 +69,30 @@ gpx-track/
   - line_a_lat, line_a_lng, line_b_lat, line_b_lng（double precision、null可）
   - status text：'ready' / 'running' / 'finished'
   - started_at, finished_at（timestamptz、null可）
-  - last_crosser_id uuid null（最後に通過した人。現在のライダーの代わりに表示するため）
+  - owner_id uuid（ルームを作った端末。v1.1.0 からは権限の判定に使わない）
+  - owner_rider_id uuid null（オーナーのライダー。今のライダーがこれになっている端末がオーナーモード）
+  - last_crosser_id uuid null（最後に通過した端末。地図で強調する端末の代わりに使う）
+  - last_crosser_rider_id uuid null（最後に通過したライダー。現在のライダーの代わりに表示する）
   - created_at
-- room_members
+- riders（名簿。v1.1.0 で追加）
+  - id uuid PK、room_id、name text（1〜20文字）、user_id uuid null、created_at
+  - unique(room_id, name)
+  - user_id：参加したときに自動で作った「本人のライダー」なら、その端末のユーザー。名簿から追加した人は null
+- room_members（端末）
   - room_id、user_id、color_idx int、joined_at、PK(room_id, user_id)
+  - current_rider_id uuid null（この端末の今のライダー）
 - crossings（通過の記録）
-  - id uuid PK、room_id、crosser_id（ラインを越えた人）、crosser_name text（その時点の名前）
+  - id uuid PK、room_id、crosser_id（ラインを越えた端末）、crosser_name text（その時点のライダーの名前）
+  - rider_id uuid null（通過したときの端末のライダー）
   - crossed_at timestamptz、source text：'gps' / 'manual'
-  - driver_override_id uuid null（オーナーが修正した名前）
+  - driver_override_rider_id uuid null（オーナーが修正したライダー）
+  - driver_override_id uuid null（v1.0.x の名残。使わない）
   - deleted bool default false、created_at
   - unique(room_id, crossed_at)
 - distance_segments（走行距離の記録）
-  - id bigserial PK、room_id、user_id、t_from timestamptz、t_to timestamptz、meters real
+  - id bigserial PK、room_id、user_id、rider_id、t_from timestamptz、t_to timestamptz、meters real
   - index (room_id, t_to)
+  - BEFORE INSERT トリガーで、rider_id が null かルームのライダーでなければ、その端末の今のライダーを入れる
 - messages
   - id bigserial PK、room_id、user_id null、name text、body text（1〜50文字）
   - kind text：'user' / 'system'、created_at
@@ -87,7 +100,7 @@ gpx-track/
 3.3 RLS
 - メンバーかどうかの判定には is_room_member(room uuid) を使う（security definer、stable）。RLS が再帰しないようにするため
 - SELECT
-  - rooms / room_members / crossings / messages / distance_segments は、is_room_member(room_id) のときだけ読める
+  - rooms / room_members / riders / crossings / messages / distance_segments は、is_room_member(room_id) のときだけ読める
   - profiles は、本人と、同じルームのメンバーの行だけ読める
 - INSERT
   - messages：user_id = auth.uid()、kind = 'user'、メンバーであること
@@ -95,35 +108,50 @@ gpx-track/
   - profiles：本人の行だけ upsert できる
 - DELETE
   - room_members：本人の行だけ削除できる（ルームからの退出に使う）
-- messages の name は、BEFORE INSERT トリガーでプロフィールの名前に置き換える（なりすまし防止）
+- messages の name は、BEFORE INSERT トリガーでその端末の今のライダーの名前（なければプロフィールの名前）に置き換える（なりすまし防止）
 - それ以外の書き込みはすべて RPC を通す。RPC は security definer にし、関数の中で権限を確認し、search_path = '' に固定する
 
 3.4 RPC
 - create_room(passcode, team_name, duration_min, min_lap_sec, moving_kmh)
   - extensions.crypt でパスコードを照合する。紛らわしい文字を除いた6文字のコードを作り、重複したら作り直す
-  - ルームと、オーナーのメンバー行を作る
+  - ルームと、作った人の本人のライダーを作り、それを owner_rider_id にする。メンバー行の current_rider_id にも入れる
 - join_room(code)
   - メンバーに追加する（参加済みなら何もしない）。color_idx は参加順に割り当てる
+  - current_rider_id が null なら、本人のライダーを割り当てる（_assign_own_rider）
+    - 優先順：その端末の本人のライダー → プロフィールと同じ名前のライダー → 新しく作る（同じ名前があれば末尾に数字）
+    - オーナーのライダーはパスコードが必要なので、ここでは選ばない
 - reclaim_owner(code, passcode)
-  - パスコードが一致したら owner_id を自分に変え、メンバーにも追加する
+  - パスコードが一致したら join_room してから、current_rider_id を owner_rider_id にする
+- switch_rider(room, rider, passcode = null)　［メンバー］
+  - rider がルームの名簿にあることを確認する（なければ 'not_rider'）
+  - rider が owner_rider_id なら、パスコードを照合する（_check_passcode）
+  - current_rider_id を rider にする
+- add_rider(room, name)　［メンバー］
+  - 名簿に追加し（user_id = null）、current_rider_id にする。同じ名前があれば 'duplicate_name'
+- rename_rider(room, name)　［メンバー］
+  - この端末の今のライダーの名前を変える。同じ名前がほかにあれば 'duplicate_name'
+- ［オーナー］の確認（_require_owner）：呼び出した端末の current_rider_id が rooms.owner_rider_id と一致すること
 - set_line(room, a_lat, a_lng, b_lat, b_lng)　［オーナー］
 - update_room_settings(room, min_lap_sec, moving_kmh)　［オーナー］
 - start_race(room) / set_start_time(room, ts) / finish_race(room)　［オーナー］
   - 状態と時刻を更新し、システムメッセージを投稿する
-- record_crossing(room, crossed_at)　［メンバー］
+- record_crossing(room, crossed_at, rider = null)　［メンバー］
+  - rider：通過した瞬間のその端末のライダー（再送で遅れて届くことがあるため端末から送る）。null かルームのライダーでなければ、その端末の今のライダーにする
+  - v1.0.x の2引数版は drop function で削除する（引数の数が違う関数が並ぶと、呼び出しがあいまいになるため）
   - rooms の行を FOR UPDATE でロックしてから直前の通過を確認する（ほぼ同時に2人が通過したときの競合を防ぐため）
   - 確認する条件：spec 5.2 に加えて、now() より5秒以上未来の時刻は拒否する
   - 最小ラップ秒数は、前後の通過（再送で古い時刻が届く場合があるため前後両方）とレース開始時刻のどちらからも離れていることを確認する
     （スタート直後にラインを越えても1周と数えないため）
   - 同じ人が同じ時刻で送ってきた場合は 'duplicate' を返す（再送のため）
-  - 記録したら rooms.last_crosser_id を更新する（値が変わるときだけ）。前の通過と違う人なら「ライダー交代：◯◯」のシステムメッセージを投稿する
+  - 記録したら rooms.last_crosser_id と last_crosser_rider_id を更新する（値が変わるときだけ）。前の通過と違うライダーなら「ライダー交代：◯◯」のシステムメッセージを投稿する
   - 戻り値：'recorded' / 'duplicate' / 'too_soon' / 'not_running' / 'out_of_range'
 - add_manual_crossing(room, crossed_at)　［オーナー］
-  - source = 'manual'。crosser には、その時刻の直前に通過した人（いなければ last_crosser_id、それもなければオーナー）を入れる。最小ラップ秒数は確認しない
+  - source = 'manual'。crosser と rider には、その時刻の直前の通過の端末とライダー（いなければ last_crosser_id / last_crosser_rider_id、それもなければ呼び出した端末 / オーナーのライダー）を入れる。最小ラップ秒数は確認しない
 - delete_crossing(id)　［オーナー］
   - deleted = true にする（論理削除）
-- set_crossing_driver(id, user_id or null)　［オーナー］
-  - driver_override_id を設定する。null なら自動判定に戻す
+- set_crossing_driver(id, rider or null)　［オーナー］
+  - driver_override_rider_id を設定する。null なら自動判定に戻す
+  - 引数名を p_user から p_rider に変えたため、drop function してから作り直す
 - get_lap_table(room)　［メンバー］
   - ラップ表を返す（3.5を参照）
 - update_profile_name(name)　［本人］
@@ -131,15 +159,21 @@ gpx-track/
 3.5 ラップ表の計算（get_lap_table。サーバー側で計算する）
 - 対象は deleted = false の crossings。crossed_at の昇順に並べ、row_number() を周番号にする
 - 周の区間：[前の通過時刻, 今回の通過時刻]。1周目は [started_at, 1回目の通過時刻]
-- メンバーごとのその周の走行距離＝区間と重なる distance_segments の meters を合計する
+- ライダーごとのその周の走行距離＝区間と重なる distance_segments の meters を rider_id ごとに合計する
   - 一部だけ重なる区間は、重なった時間の割合で按分する
     - meters × (least(t_to, 周の終わり) − greatest(t_from, 周の始まり)) / (t_to − t_from)
 - ラップのライダーを決める優先順位
-  1. driver_override_id
-  2. 走行距離が最も長いメンバー（同じなら crosser）
-  3. どちらもなければ crosser
-- 名前は profiles の今の名前を使う（取れなければ crosser_name）
-- 戻り値の列：lap_no, crossing_id, crossed_at, lap_ms, driver_id, driver_name, driver_meters, source, is_override
+  1. driver_override_rider_id
+  2. 走行距離が最も長いライダー（同じなら通過したライダー rider_id）
+  3. どちらもなければ通過したライダー rider_id
+- 名前は riders の今の名前を使う（取れなければ crosser_name）
+- 戻り値の列：lap_no, crossing_id, crossed_at, lap_ms, driver_id（ライダーID）, driver_name, driver_meters, source, is_override, crosser_id（端末）
+
+3.5.1 v1.0.x からの移行（schema.sql の最後の DO ブロック。まだ移していない行だけが対象なので、何度実行してもよい）
+- オーナーの端末に本人のライダーを作り、owner_rider_id にする
+- ほかのメンバーにも本人のライダーを割り当てる（_assign_own_rider）
+- crossings.rider_id / driver_override_rider_id、distance_segments.rider_id に、その端末の本人のライダーを入れる
+- last_crosser_rider_id を取り直す
 - 名前の確定：直近の周で、終わってから15秒未満のものは「暫定」とし、クライアント側で薄く表示する
 
 3.6 Realtime
@@ -149,9 +183,9 @@ gpx-track/
 - realtime.messages に付けるポリシー（SELECT と INSERT、対象は authenticated）
   - exists(select 1 from public.room_members m where m.user_id = (select auth.uid()) and 'room:' || m.room_id::text = (select realtime.topic())) and realtime.messages.extension in ('broadcast','presence')
   - realtime.messages には ALTER TABLE をかけない（公式ドキュメントで禁止されているため）
-- クライアントから送る broadcast「pos」：{ uid, lat, lng, acc, spd, moving, t }
+- クライアントから送る broadcast「pos」：{ uid, rid, lat, lng, acc, spd, moving, t }（rid はその端末の今のライダー）
 - presence：参加したときに track({ uid, name }) を1回だけ行う（Presence は頻繁に更新しない、という公式の注意に従う）
-- DBの変更の配信：rooms / crossings / messages / room_members / profiles（名前の変更）に AFTER トリガーを付ける
+- DBの変更の配信：rooms / crossings / messages / room_members / profiles（名前の変更）/ riders（名簿の追加と名前の変更。member イベント）に AFTER トリガーを付ける
   - realtime.send(payload, event, 'room:' || room_id, true) で同じトピックに送る
   - 配信に失敗しても本来の処理（通過の記録など）は止めない（例外を握りつぶして警告だけ出す）
   - イベント名：room / crossing / message / member
@@ -201,7 +235,8 @@ gpx-track/
   - ピット→走行中：判定速度以上が10秒続いたとき
   - 走行中→ピット：判定速度未満が30秒続いたとき
 - 走行距離：直前の点から今回の点までの区間速度が判定速度以上で、間隔が20秒以内なら、その距離を加える
-- 加えた距離は10秒ごとに1つのセグメント { t_from, t_to, meters } にまとめて、distance_segments に INSERT する
+- 加えた距離は10秒ごとに1つのセグメント { t_from, t_to, meters } にまとめて、その端末の今のライダー（rider_id）を付けて distance_segments に INSERT する
+  - この端末のライダーを切り替えたときは、それまでの距離を前のライダーの分として先に送る
   - meters が 0 のセグメントは送らない
   - 送信に失敗したら crossingQueue に入れて再送する
   - レース中のときだけ送る
@@ -216,7 +251,9 @@ gpx-track/
   - attribution：&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors
   - OSM の利用規約に従い、先読みや一括ダウンロードはしない。Referrer-Policy は既定のまま（no-referrer にしない）
 - マーカーは L.divIcon で作る（色付きの丸と名前）。パレットは10色で、color_idx を10で割った余りで選ぶ
-- 現在のライダー：pos の moving が true のメンバーを選ぶ。複数いれば速度が速い方。誰もいなければ rooms.last_crosser_id
+- 現在のライダー：pos の moving が true の端末を選ぶ。複数いれば速度が速い方。名前はその pos の rid のライダー
+  - 誰もいなければ、端末は rooms.last_crosser_id、名前は rooms.last_crosser_rider_id のライダー
+- オーナーモードの判定（クライアント）：自分の room_members.current_rider_id が rooms.owner_rider_id と一致すること（サーバー側は _require_owner で確認する）
 - Wake Lock
   - 'wakeLock' in navigator で対応しているか判定する
   - navigator.wakeLock.request('screen') を try/catch で囲む
@@ -224,6 +261,15 @@ gpx-track/
 - 時刻：表示は端末のローカル時刻。サーバーへは ISO8601（UTC）で送る
 - alert と confirm は使わず、Modal コンポーネントで表示する
 - 画面の切り替えは state で行う。URL は ?room=<code> だけ読み取り、参加の入力を補助する
+- 認証（hooks/useAuth.ts）：削除されたユーザーからの自動復帰（@supabase/auth-js 2.118.0 のソースで動作を確認）
+  - 名前を登録・変更したら localStorage の gpx-track.name にも保存する
+  - 起動時、getSession() でログイン情報があれば getUser() でサーバーに確認する
+  - エラーが AuthSessionMissingError、または AuthApiError で code が user_not_found / session_not_found か status が 401 / 403 / 404 なら、ユーザーが消されたと判断する
+    - 通信エラー（AuthRetryableFetchError、status 0）は対象にしない
+  - そのときは signOut({ scope: 'local' }) で端末のログイン情報だけを消す（このSDKは 401 / 403 / 404 を無視して端末の情報を消す）
+    - あわせて localStorage の gpx-track.currentRoom と gpx-track.queue を消す
+  - gpx-track.name があれば、signInAnonymously と update_profile_name で入り直す。App はルーム画面を開かずにホームを表示する
+  - 名前の登録で外部キー違反（23503）が出たときも、同じようにログイン情報を消して1回だけ入り直す
 
 ■8. Cloudflare デプロイ（Workers の静的アセット。Cloudflare が新規プロジェクト向けに案内している方式）
 - wrangler.jsonc

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { LAP_PROVISIONAL_SEC } from '../config'
 import { formatClock, formatLap } from '../lib/format'
 import { buildLapView, type LapViewRow } from '../lib/laps'
-import type { LapRow, Member } from '../lib/types'
+import type { LapRow, Rider, Room } from '../lib/types'
 import { LapRowMenu } from './LapRowMenu'
 
 interface Props {
@@ -10,11 +10,12 @@ interface Props {
   laps: LapRow[]
   now: number
   isOwner: boolean
-  members: Member[]
+  room: Room
+  riders: Rider[]
   onChanged: () => void
 }
 
-export function LapTable({ visible, laps, now, isOwner, members, onChanged }: Props) {
+export function LapTable({ visible, laps, now, isOwner, room, riders, onChanged }: Props) {
   const [selected, setSelected] = useState<LapViewRow | null>(null)
   const view = buildLapView(laps, now, LAP_PROVISIONAL_SEC)
   const { summary } = view
@@ -73,7 +74,8 @@ export function LapTable({ visible, laps, now, isOwner, members, onChanged }: Pr
       {selected && (
         <LapRowMenu
           lap={selected}
-          members={members}
+          room={room}
+          riders={riders}
           onClose={() => setSelected(null)}
           onDone={() => {
             setSelected(null)
