@@ -6,6 +6,7 @@ import { useRoom } from '../hooks/useRoom'
 import { useTracker } from '../hooks/useTracker'
 import { useWakeLock } from '../hooks/useWakeLock'
 import { ChatArea, QuickButtons } from './ChatArea'
+import { ExportMenu } from './ExportMenu'
 import { Header } from './Header'
 import { LapTable } from './LapTable'
 import { MapView } from './MapView'
@@ -34,6 +35,7 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
   const [editingLine, setEditingLine] = useState(false)
   const [info, setInfo] = useState<Info>(null)
   const [picking, setPicking] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   const me = members.find((m) => m.user_id === userId)
   const myRiderId = me?.rider_id ?? null
@@ -172,6 +174,10 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
             setSettings(false)
             setPicking(true)
           }}
+          onExport={() => {
+            setSettings(false)
+            setExporting(true)
+          }}
           onEditLine={() => {
             setTab('map')
             setEditingLine(true)
@@ -184,6 +190,8 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
           }}
         />
       )}
+
+      {exporting && <ExportMenu roomId={room.id} onClose={() => setExporting(false)} />}
 
       {picking && (
         <RiderPicker

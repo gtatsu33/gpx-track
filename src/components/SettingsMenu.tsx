@@ -13,6 +13,7 @@ interface Props {
   myRiderName: string
   onClose: () => void
   onRiderPick: () => void
+  onExport: () => void
   onEditLine: () => void
   onLeave: () => void
   onChanged: () => void
@@ -20,7 +21,17 @@ interface Props {
 
 type Confirm = 'start' | 'finish' | 'leave' | null
 
-export function SettingsMenu({ room, isOwner, myRiderName, onClose, onRiderPick, onEditLine, onLeave, onChanged }: Props) {
+export function SettingsMenu({
+  room,
+  isOwner,
+  myRiderName,
+  onClose,
+  onRiderPick,
+  onExport,
+  onEditLine,
+  onLeave,
+  onChanged,
+}: Props) {
   const notify = useNotify()
   const [name, setName] = useState(myRiderName)
   const [startTime, setStartTime] = useState(room.started_at ? toDatetimeLocal(room.started_at) : '')
@@ -106,6 +117,15 @@ export function SettingsMenu({ room, isOwner, myRiderName, onClose, onRiderPick,
           </button>
         </div>
       </section>
+
+      {room.status !== 'ready' && (
+        <section className="menu-sec">
+          <h3>結果の出力</h3>
+          <button className="btn block" onClick={onExport}>
+            CSVの保存・結果の共有
+          </button>
+        </section>
+      )}
 
       <section className="menu-sec">
         <h3>参加コード</h3>

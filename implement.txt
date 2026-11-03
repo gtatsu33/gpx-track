@@ -1,5 +1,5 @@
 耐久レース チーム位置共有アプリ 実装仕様書
-作成日：2026-11-02（2026-11-03 更新）　対象バージョン：APP_VERSION 1.1.1
+作成日：2026-11-02（2026-11-03 更新）　対象バージョン：APP_VERSION 1.2.0
 
 ■1. 技術スタック（2026-11-02 に npm registry と公式ドキュメントで確認した安定版）
 - vite 8.3.5
@@ -36,6 +36,7 @@ gpx-track/
     lib/movingState.ts         走行状態と走行距離の計算（純粋関数）
     lib/laps.ts                ラップ表を組み立てる（純粋関数）
     lib/format.ts              時刻とラップタイムの書式
+    lib/export.ts              結果の出力：集計、CSV、共有テキストを作る（純粋関数）
     lib/types.ts               型定義（Room, LapRow, Fix など）
     lib/crossingQueue.ts       送信できなかった通過と距離データを保存し（localStorage）、再送する
     hooks/useAuth.ts           匿名サインインとプロフィール
@@ -46,9 +47,10 @@ gpx-track/
     components/  NameSetup, Home, CreateRoom, ReclaimOwner, RoomScreen, Header,
                  MapView（ライン編集を含む）, LapTable, LapRowMenu, ChatArea（QuickButtons を含む）,
                  SettingsMenu, RiderPicker（この端末のライダーの切り替え・追加）,
+                 ExportMenu（結果の出力。ルーム画面とホームの両方から開く）,
                  Modal（ConfirmModal を含む）, Notify（画面上部の通知）
     dev/gpsSimulator.ts        開発用の疑似GPS
-  tests/  geo.test.ts, lapDetector.test.ts, movingState.test.ts, laps.test.ts, format.test.ts
+  tests/  geo.test.ts, lapDetector.test.ts, movingState.test.ts, laps.test.ts, format.test.ts, export.test.ts
 
 ■3. Supabase
 3.1 事前設定（ユーザーがダッシュボードで行う）
@@ -261,6 +263,14 @@ gpx-track/
 - 時刻：表示は端末のローカル時刻。サーバーへは ISO8601（UTC）で送る
 - alert と confirm は使わず、Modal コンポーネントで表示する
 - 画面の切り替えは state で行う。URL は ?room=<code> だけ読み取り、参加の入力を補助する
+- 結果の出力（components/ExportMenu.tsx、lib/export.ts）
+  - 開いたときに rooms / get_lap_table / riders を取り直す。共有はボタンを押した直後に呼ぶ必要がある（ユーザー操作の中で呼ぶ）ため、データは先に取っておく
+  - 集計は get_lap_table の結果からクライアントで行う（サーバーの変更なし）。ベストと平均は lib/laps.ts の buildLapView と同じ値を使う
+  - CSV：Blob(['﻿', 本文], { type: 'text/csv;charset=utf-8' })
+    - iOS / iPadOS（UA が iPhone/iPad/iPod、または Macintosh でタッチ対応）で navigator.canShare({ files }) が true なら navigator.share({ files }) を使う
+      （iOS Safari 14 以降で files の共有に対応。古い iOS で canShare が false になる報告があるので必ず確認する）
+    - それ以外と、共有に失敗したとき（AbortError を除く）は、URL.createObjectURL と <a download> でダウンロードする
+  - 共有テキスト：navigator.share({ text }) → navigator.clipboard.writeText → テキスト欄に表示、の順に試す。AbortError（ユーザーが閉じた）は何もしない
 - 認証（hooks/useAuth.ts）：削除されたユーザーからの自動復帰（@supabase/auth-js 2.118.0 のソースで動作を確認）
   - 名前を登録・変更したら localStorage の gpx-track.name にも保存する
   - 起動時、getSession() でログイン情報があれば getUser() でサーバーに確認する
@@ -312,6 +322,7 @@ gpx-track/
   - lapDetector：交差する、しない、平行、延長した部分での交差、通過時刻の補間、速度が足りない、間隔が長すぎる
   - movingState：ヒステリシス、精度による除外、距離の加算、セグメントへのまとめ方
   - laps：降順の並べ替え、ベストラップ、平均
+  - export：CSV のエスケープ、ライダー別の集計、CSV の3つの表と CRLF、ファイル名、共有テキスト（結果と途中経過）
   - format：時刻とラップタイムの書式
 - SQL の確認（Supabase の SQL Editor）
   - get_lap_table の按分とライダー判定を、テスト用のデータで確認する（Aが7割、Bが3割走った周がAになること）

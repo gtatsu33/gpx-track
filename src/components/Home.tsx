@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { errorText, supabase } from '../lib/supabase'
 import type { RoomStatus } from '../lib/types'
 import { APP_VERSION } from '../version'
+import { ExportMenu } from './ExportMenu'
 import { useNotify } from './Notify'
 
 interface RoomItem {
@@ -26,6 +27,7 @@ export function Home({ userName, initialCode, onEnter, onCreate, onReclaim }: Pr
   const [code, setCode] = useState(initialCode)
   const [busy, setBusy] = useState(false)
   const [rooms, setRooms] = useState<RoomItem[]>([])
+  const [exporting, setExporting] = useState<string | null>(null)
   const notify = useNotify()
 
   useEffect(() => {
@@ -82,13 +84,18 @@ export function Home({ userName, initialCode, onEnter, onCreate, onReclaim }: Pr
           <h2>参加中のルーム</h2>
           <ul className="room-list">
             {rooms.map((r) => (
-              <li key={r.id}>
+              <li key={r.id} className="room-row">
                 <button className="room-item" onClick={() => onEnter(r.id)}>
                   <span className="room-name">{r.team_name}</span>
                   <span className="room-meta">
                     {r.code}・{STATUS_LABEL[r.status]}
                   </span>
                 </button>
+                {r.status !== 'ready' && (
+                  <button className="btn" onClick={() => setExporting(r.id)} aria-label={`${r.team_name} の結果を出力`}>
+                    出力
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -106,6 +113,8 @@ export function Home({ userName, initialCode, onEnter, onCreate, onReclaim }: Pr
       </section>
 
       <footer className="version">v{APP_VERSION}</footer>
+
+      {exporting && <ExportMenu roomId={exporting} onClose={() => setExporting(null)} />}
     </div>
   )
 }
