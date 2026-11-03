@@ -1,5 +1,5 @@
 -- =====================================================================
--- gpx-track  Supabase スキーマ（APP_VERSION 1.1.0）
+-- gpx-track  Supabase スキーマ（APP_VERSION 1.2.1）
 -- SQL Editor でこのファイルを丸ごと実行する。何度実行しても壊れないように書いている。
 -- 実行後に set_owner_passcode.sql でオーナーパスコードを設定すること。
 -- =====================================================================
@@ -369,10 +369,13 @@ drop trigger if exists bc_rooms on public.rooms;
 create trigger bc_rooms after update on public.rooms
   for each row execute function public._bc_rooms();
 
+-- op と crossed_at は、クライアントがラップ表の後ろだけを取り直してよいかを判断するのに使う
+-- （最後に追加された通過なら後ろだけ、それ以外の追加・更新は全部を取り直す）
 create or replace function public._bc_crossings()
 returns trigger language plpgsql security definer set search_path = '' as $$
 begin
-  perform public._room_broadcast(new.room_id, 'crossing', jsonb_build_object('id', new.id));
+  perform public._room_broadcast(new.room_id, 'crossing', jsonb_build_object(
+    'id', new.id, 'op', lower(tg_op), 'crossed_at', new.crossed_at));
   return null;
 end $$;
 drop trigger if exists bc_crossings on public.crossings;
@@ -783,7 +786,10 @@ begin
 end $$;
 
 -- ラップ表（周番号・ラップタイム・ライダーをサーバー側で計算）
-create or replace function public.get_lap_table(p_room uuid)
+-- p_from：この周以降の行だけを返す（通信量を抑えるため。省略すると全周）
+-- v1.2.0 までの1引数版は削除する（引数の数が違う関数が並ぶと、呼び出しがあいまいになるため）
+drop function if exists public.get_lap_table(uuid);
+create or replace function public.get_lap_table(p_room uuid, p_from int default 1)
 returns table (
   lap_no int,
   crossing_id uuid,
@@ -820,6 +826,7 @@ begin
     from c
     join public.distance_segments s
       on s.room_id = p_room and s.rider_id is not null and s.t_to > c.lap_start and s.t_from < c.crossed_at
+    where c.n >= coalesce(p_from, 1) -- 走行距離の集計は返す周の分だけ行う
     group by c.id, s.rider_id
   ),
   best as (
@@ -845,6 +852,7 @@ begin
   from pick
   left join public.riders rd on rd.id = pick.drv
   left join d dm on dm.cid = pick.id and dm.rider_id = pick.drv
+  where pick.n >= coalesce(p_from, 1)
   order by pick.n;
 end $$;
 

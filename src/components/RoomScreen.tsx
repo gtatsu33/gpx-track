@@ -47,9 +47,10 @@ export function RoomScreen({ roomId, userId, userName, onExit }: Props) {
 
   const onCrossing = useCallback(
     (res: string) => {
-      if (res === 'ok') void data.loadLaps()
+      // 自分の通過は最後に追加されるので、後ろだけ取り直す
+      if (res === 'ok') void data.loadLapsTail()
     },
-    [data.loadLaps],
+    [data.loadLapsTail],
   )
   const { moving, geoStatus } = useTracker({
     room,

@@ -18,6 +18,35 @@ export interface LapView {
   summary: LapSummary
 }
 
+/**
+ * 後ろだけ取り直すときの開始周：手元の最後の周（1行重ねて取り、ずれを検知するため）。
+ * 手元が空なら null（全部を取り直す）
+ */
+export function lapTailFrom(cur: LapRow[]): number | null {
+  return cur.length ? cur[cur.length - 1].lap_no : null
+}
+
+/**
+ * 後ろだけ取った行（from 周目以降）を、手元のラップ表（周番号の昇順）に差し替える。
+ * 重ねて取った from 周目の通過が手元と違う（途中で周が削除・追加されて番号がずれた）ときは null を返す（全部を取り直す）
+ */
+export function mergeLapTail(cur: LapRow[], tail: LapRow[], from: number): LapRow[] | null {
+  const mine = cur.find((l) => l.lap_no === from)
+  const theirs = tail[0]
+  if (!mine || !theirs || theirs.lap_no !== from || theirs.crossing_id !== mine.crossing_id) return null
+  return [...cur.filter((l) => l.lap_no < from), ...tail]
+}
+
+/**
+ * 通過の配信を受けたとき、後ろだけ取り直してよいか。
+ * 最後に追加された通過（手元の最後の周より後の時刻）だけが対象。更新（削除・名前の修正）や、過去の時刻への追加は全部を取り直す
+ */
+export function canLoadLapTail(cur: LapRow[], ev: { op?: string; crossed_at?: string | null }): boolean {
+  const last = cur[cur.length - 1]
+  if (!last || ev.op !== 'insert' || !ev.crossed_at) return false
+  return Date.parse(ev.crossed_at) > Date.parse(last.crossed_at)
+}
+
 export function buildLapView(laps: LapRow[], nowMs: number, provisionalSec: number): LapView {
   const valid = laps.filter((l) => l.lap_ms != null && l.lap_ms >= 0)
   let best: LapRow | null = null

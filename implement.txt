@@ -1,5 +1,5 @@
 耐久レース チーム位置共有アプリ 実装仕様書
-作成日：2026-11-02（2026-11-03 更新）　対象バージョン：APP_VERSION 1.2.0
+作成日：2026-11-02（2026-11-03 更新）　対象バージョン：APP_VERSION 1.2.1
 
 ■1. 技術スタック（2026-11-02 に npm registry と公式ドキュメントで確認した安定版）
 - vite 8.3.5
@@ -154,8 +154,9 @@ gpx-track/
 - set_crossing_driver(id, rider or null)　［オーナー］
   - driver_override_rider_id を設定する。null なら自動判定に戻す
   - 引数名を p_user から p_rider に変えたため、drop function してから作り直す
-- get_lap_table(room)　［メンバー］
-  - ラップ表を返す（3.5を参照）
+- get_lap_table(room, from = 1)　［メンバー］
+  - ラップ表を返す（3.5を参照）。from 周目以降の行だけを返す（通信量を抑えるため。省略すると全周）
+  - v1.2.0 までの1引数版は drop function で削除する
 - update_profile_name(name)　［本人］
 
 3.5 ラップ表の計算（get_lap_table。サーバー側で計算する）
@@ -170,13 +171,24 @@ gpx-track/
   3. どちらもなければ通過したライダー rider_id
 - 名前は riders の今の名前を使う（取れなければ crosser_name）
 - 戻り値の列：lap_no, crossing_id, crossed_at, lap_ms, driver_id（ライダーID）, driver_name, driver_meters, source, is_override, crosser_id（端末）
+- from を指定したとき：周番号とラップタイムを正しく付けるため、通過の並べ替えは全周で行う。走行距離の集計と返す行は from 周目以降だけにする
+- 名前の確定：直近の周で、終わってから15秒未満のものは「暫定」とし、クライアント側で薄く表示する
 
 3.5.1 v1.0.x からの移行（schema.sql の最後の DO ブロック。まだ移していない行だけが対象なので、何度実行してもよい）
 - オーナーの端末に本人のライダーを作り、owner_rider_id にする
 - ほかのメンバーにも本人のライダーを割り当てる（_assign_own_rider）
 - crossings.rider_id / driver_override_rider_id、distance_segments.rider_id に、その端末の本人のライダーを入れる
 - last_crosser_rider_id を取り直す
-- 名前の確定：直近の周で、終わってから15秒未満のものは「暫定」とし、クライアント側で薄く表示する
+
+3.5.2 ラップ表の取り直し（hooks/useRoom.ts、lib/laps.ts）
+- 「全部」と「後ろだけ」の2通りで取る
+  - 後ろだけ：手元の最後の周を from にして取る（1行重ねる）。重ねた周の crossing_id が手元と違えば、途中で周番号がずれたとみなして全部を取り直す
+- どちらで取るか
+  - 後ろだけ：最後に追加された通過の配信（op = 'insert' で、手元の最後の周より後の時刻）、その16秒後の確定、自分の通過の記録、1分ごとの定期取得
+  - 全部：それ以外の通過の配信（削除・名前の修正・過去の時刻への追加）、開始時刻の修正（id が null の配信）、ルームを開いたとき・再接続したとき、オーナー操作のあと、10回に1回の定期取得（10分ごと）
+- 取得は1本ずつ順番に行う。取得中に来た依頼は1つにまとめて、終わったあとに行う（全部 > 後ろだけ の優先）。応答が前後して古いデータで上書きしないため
+- ベスト、平均、★、暫定の表示は、差し替えたあとのラップ表全体から計算する
+- 結果の出力（ExportMenu）は、毎回全部を取る
 
 3.6 Realtime
 - 1ルームにつき private チャネルを1本だけ使う
@@ -191,11 +203,12 @@ gpx-track/
   - realtime.send(payload, event, 'room:' || room_id, true) で同じトピックに送る
   - 配信に失敗しても本来の処理（通過の記録など）は止めない（例外を握りつぶして警告だけ出す）
   - イベント名：room / crossing / message / member
+  - crossing の payload：{ id, op（'insert' / 'update'）, crossed_at }。開始時刻の修正のときは { id: null }
   - distance_segments の挿入は配信しない（配信の回数を節約するため）
   - postgres_changes は使わない（DELETE で絞り込めないこと、private チャネル1本にまとめられないことが理由）
 - 受け取ったときの処理
   - message：リストに追加する
-  - crossing：get_lap_table を呼び直す。さらに15秒後にもう一度呼び、遅れて届いた距離データで名前を確定させる
+  - crossing：get_lap_table を呼び直す（全部か後ろだけかは 3.5.2）。さらに16秒後に後ろだけをもう一度取り、遅れて届いた距離データで名前を確定させる
   - room / member：該当するデータを取り直す
 - チャネルの状態が SUBSCRIBED に戻ったとき（再接続したとき）は、すべてのデータを取り直して取りこぼしを埋める
 - サインインした後に supabase.realtime.setAuth() を呼んでからチャネルに参加する（今のSDKで必要かどうかは実装するときに確認する）
@@ -321,7 +334,7 @@ gpx-track/
   - geo：距離、平面化
   - lapDetector：交差する、しない、平行、延長した部分での交差、通過時刻の補間、速度が足りない、間隔が長すぎる
   - movingState：ヒステリシス、精度による除外、距離の加算、セグメントへのまとめ方
-  - laps：降順の並べ替え、ベストラップ、平均
+  - laps：降順の並べ替え、ベストラップ、平均、後ろだけ取り直すときの差し替えと、ずれの検知、後ろだけでよいかの判定
   - export：CSV のエスケープ、ライダー別の集計、CSV の3つの表と CRLF、ファイル名、共有テキスト（結果と途中経過）
   - format：時刻とラップタイムの書式
 - SQL の確認（Supabase の SQL Editor）
